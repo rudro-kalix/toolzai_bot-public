@@ -14,7 +14,10 @@ export type Overview = {
 };
 
 export type UserRow = { telegram_id: number; username: string | null; first_name: string | null; last_name: string | null; balance_bdt: number; language: string; human_verified: number; created_at: string };
-export type PaymentRow = { transaction_id: string; telegram_id: number; amount_bdt: number; provider: string; claimed_at: string };
+export type PaymentRow = {
+  transaction_id: string; telegram_id: number; amount_bdt: number; provider: string; claimed_at: string;
+  username: string | null; first_name: string | null; last_name: string | null;
+};
 export type OrderRow = { id: number; telegram_id: number; product_key: string; variant_key: string | null; quantity: number; charged_bdt: number; provider_order_id: string | null; created_at: string };
 export type ReferralRow = {
   referred_id: number; referrer_id: number; status: string; created_at: string; completed_at: string | null;
@@ -28,6 +31,18 @@ export type WithdrawalRow = {
   admin_note: string; created_at: string; reviewed_at: string | null; reviewed_by: string | null;
   username: string | null; first_name: string | null; last_name: string | null;
   referral_count: number; purchase_count: number; total_earned_bdt: number;
+};
+export type WithdrawalPurchaseEvidence = {
+  reward_id: number; local_order_id: number; referred_id: number; username: string | null; first_name: string | null; last_name: string | null;
+  product_key: string; variant_key: string | null; quantity: number; charged_bdt: number; provider_order_id: string | null;
+  purchased_at: string; reward_bdt: number; rewarded_at: string;
+};
+export type WithdrawalPaymentEvidence = PaymentRow;
+export type WithdrawalEvidence = {
+  withdrawal: Pick<WithdrawalRow, "id" | "telegram_id" | "amount_bdt" | "bkash_number" | "status" | "admin_note" | "created_at" | "reviewed_at" | "reviewed_by" | "username" | "first_name" | "last_name">;
+  purchases: WithdrawalPurchaseEvidence[];
+  payments: WithdrawalPaymentEvidence[];
+  totals: { purchase_count: number; purchase_amount_bdt: number; reward_bdt: number; payment_count: number; payment_amount_bdt: number };
 };
 export type AnnouncementRow = {
   id: string; message_text: string; button_label: string | null; button_url: string | null;
@@ -78,6 +93,13 @@ export async function getReferralSummary() {
 
 export async function getWithdrawals() {
   return (await managerD1<WithdrawalRow>("withdrawals")).rows;
+}
+
+export async function getWithdrawalEvidence(withdrawalId: string) {
+  if (!/^[0-9a-f-]{36}$/i.test(withdrawalId)) throw new Error("Invalid withdrawal request.");
+  const row = (await managerD1<WithdrawalEvidence>("withdrawalEvidence", { withdrawalId })).rows[0];
+  if (!row) throw new Error("Withdrawal evidence was not found.");
+  return row;
 }
 
 export async function getAnnouncements() {

@@ -14,4 +14,5 @@ export async function reviewWithdrawal(form: FormData) {
   if (note.length > 300) throw new Error("The admin note must be 300 characters or less.");
   await managerD1("updateWithdrawalStatus", { withdrawalId, status, note });
   revalidatePath("/referrals");
+  revalidatePath(`/referrals/${withdrawalId}`);
 }

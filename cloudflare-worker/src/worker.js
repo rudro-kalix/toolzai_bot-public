@@ -371,6 +371,54 @@ async function runManagerOperation(env, payload, ctx = null) {
     };
   }
 
+  if (operation === "withdrawalEvidence") {
+    const withdrawalId = String(payload?.withdrawalId || "");
+    if (!/^[0-9a-f-]{36}$/i.test(withdrawalId)) throw new Error("invalid_withdrawal_id");
+    const withdrawal = await env.DB.prepare(`SELECT withdrawals.id, withdrawals.telegram_id, withdrawals.amount_bdt,
+      withdrawals.bkash_number, withdrawals.status, withdrawals.admin_note, withdrawals.created_at,
+      withdrawals.reviewed_at, withdrawals.reviewed_by, users.username, users.first_name, users.last_name
+      FROM referral_withdrawals AS withdrawals
+      LEFT JOIN users ON users.telegram_id = withdrawals.telegram_id
+      WHERE withdrawals.id = ?`).bind(withdrawalId).first();
+    if (!withdrawal) throw new Error("withdrawal_not_found");
+
+    const [purchaseResult, paymentResult] = await env.DB.batch([
+      env.DB.prepare(`SELECT rewards.id AS reward_id, rewards.local_order_id, rewards.referred_id,
+        users.username, users.first_name, users.last_name, orders.product_key, orders.variant_key,
+        orders.quantity, orders.charged_bdt, orders.provider_order_id, orders.created_at AS purchased_at,
+        rewards.reward_bdt, rewards.created_at AS rewarded_at
+        FROM referral_rewards AS rewards
+        JOIN local_orders AS orders ON orders.id = rewards.local_order_id
+        LEFT JOIN users ON users.telegram_id = rewards.referred_id
+        WHERE rewards.referrer_id = ?
+        ORDER BY rewards.created_at DESC LIMIT 100`).bind(withdrawal.telegram_id),
+      env.DB.prepare(`SELECT payments.transaction_id, payments.telegram_id, payments.amount_bdt,
+        payments.provider, payments.claimed_at, users.username, users.first_name, users.last_name
+        FROM claimed_payments AS payments
+        JOIN referrals ON referrals.referred_id = payments.telegram_id
+          AND referrals.referrer_id = ? AND referrals.status = 'completed'
+        LEFT JOIN users ON users.telegram_id = payments.telegram_id
+        ORDER BY payments.claimed_at DESC LIMIT 200`).bind(withdrawal.telegram_id),
+    ]);
+    const purchases = purchaseResult.results || [];
+    const payments = paymentResult.results || [];
+    return {
+      rows: [{
+        withdrawal,
+        purchases,
+        payments,
+        totals: {
+          purchase_count: purchases.length,
+          purchase_amount_bdt: purchases.reduce((sum, item) => sum + Number(item.charged_bdt || 0), 0),
+          reward_bdt: purchases.reduce((sum, item) => sum + Number(item.reward_bdt || 0), 0),
+          payment_count: payments.length,
+          payment_amount_bdt: payments.reduce((sum, item) => sum + Number(item.amount_bdt || 0), 0),
+        },
+      }],
+      changes: 0,
+    };
+  }
+
   const reads = {
     overview: `SELECT
       (SELECT COUNT(*) FROM users) AS users,
@@ -383,7 +431,10 @@ async function runManagerOperation(env, payload, ctx = null) {
       (SELECT COALESCE(SUM(reward_bdt), 0) FROM referral_rewards) AS referral_rewards,
       (SELECT COUNT(*) FROM referral_withdrawals WHERE status = 'pending') AS pending_withdrawals`,
     users: "SELECT telegram_id, username, first_name, last_name, balance_bdt, language, human_verified, created_at FROM users ORDER BY created_at DESC LIMIT 100",
-    payments: "SELECT transaction_id, telegram_id, amount_bdt, provider, claimed_at FROM claimed_payments ORDER BY claimed_at DESC LIMIT 100",
+    payments: `SELECT payments.transaction_id, payments.telegram_id, payments.amount_bdt, payments.provider,
+      payments.claimed_at, users.username, users.first_name, users.last_name
+      FROM claimed_payments AS payments LEFT JOIN users ON users.telegram_id = payments.telegram_id
+      ORDER BY payments.claimed_at DESC LIMIT 100`,
     orders: "SELECT id, telegram_id, product_key, variant_key, quantity, charged_bdt, provider_order_id, created_at FROM local_orders ORDER BY id DESC LIMIT 100",
     referrals: `SELECT referrals.referred_id, referrals.referrer_id, referrals.status, referrals.created_at, referrals.completed_at,
       referred.username AS referred_username, referred.first_name AS referred_first_name, referred.last_name AS referred_last_name,
