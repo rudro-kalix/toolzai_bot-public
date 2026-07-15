@@ -1,0 +1,13 @@
+node_modules/
+.next/
+.vercel/
+.wrangler/
+.dev.vars
+.env
+.env.local
+.env.*.local
+cloudflare-worker/wrangler.toml
+npm-debug.log*
+*.tsbuildinfo
+*.sqlite*
+*.log

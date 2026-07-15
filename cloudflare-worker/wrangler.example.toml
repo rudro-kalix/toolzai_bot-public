@@ -1,0 +1,22 @@
+name = "digital-product-telegram-bot"
+main = "src/worker.js"
+compatibility_date = "2026-07-10"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "digital_product_bot"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[vars]
+QUANTUM_VAULT_BASE_URL = "https://www.quantumvault.me/api/v1"
+FIREBASE_PROJECT_ID = "your-firebase-project-id"
+FIREBASE_PAYMENTS_COLLECTION = "transactions,notifications"
+FIREBASE_CLAIMS_COLLECTION = "transaction_claims"
+FIREBASE_REFERRALS_COLLECTION = "referrals"
+ADMIN_IDS = "your-telegram-numeric-id"
+SUPPORT_URL = "https://t.me/your_support_username"
+REQUIRED_CHANNEL_USERNAME = "@your_channel"
+REQUIRED_CHANNEL_URL = "https://t.me/your_channel"
