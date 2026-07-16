@@ -2,13 +2,15 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Activity, BadgeDollarSign, Bot, Boxes, Gauge, ListTree, Megaphone, MessageSquareText, PlugZap, ReceiptText, Tags, Users, Waypoints } from "lucide-react";
+import { Activity, BadgeDollarSign, Bot, Boxes, Database, Gauge, ListTree, Megaphone, MessageSquareText, PackagePlus, PlugZap, ReceiptText, Tags, Users, Waypoints } from "lucide-react";
 
 const links = [
   { href: "/dashboard", label: "Overview", icon: Gauge },
   { href: "/users", label: "Users", icon: Users },
   { href: "/payments", label: "Payments", icon: BadgeDollarSign },
+  { href: "/firestore", label: "Firestore data", icon: Database },
   { href: "/orders", label: "Orders", icon: ReceiptText },
+  { href: "/products", label: "Products & stock", icon: PackagePlus },
   { href: "/referrals", label: "Referrals", icon: Waypoints },
   { href: "/announcements", label: "Post", icon: Megaphone },
   { href: "/prices", label: "Prices", icon: Tags },

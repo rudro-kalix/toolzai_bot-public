@@ -5,6 +5,8 @@ A private, mobile-friendly Next.js dashboard for operating the ToolzAI Telegram 
 ## Controls
 
 - Users, usernames, balances, payments, and orders
+- Local products, flexible delivery fields, and encrypted stock counts
+- Firestore document editing and encrypted whole-project Firebase switching with rollback
 - Fixed BDT product prices
 - Referral rewards and withdrawal review
 - Announcement campaigns
@@ -13,6 +15,10 @@ A private, mobile-friendly Next.js dashboard for operating the ToolzAI Telegram 
 - No-code seller API configuration with a connection test
 
 The Seller API page changes the supplier base URL, authentication style, endpoint paths, request fields, and JSON response mappings without redeploying the bot. API keys are sent only to the Worker over HTTPS, encrypted there, and never readable from the dashboard afterward.
+
+The Products & stock page creates API-free products and uploads credentials or other digital values. Plaintext stock is sent only to the authenticated Worker and is never returned to the dashboard.
+
+The Firestore page can browse documents or replace the bot's entire Firebase project. A replacement service account is validated before activation, and the previous encrypted connection can be restored from the same page.
 
 ## Why Vercel instead of GitHub Pages
 
@@ -29,7 +35,7 @@ TELEGRAM_BOT_TOKEN=optional-for-health-page
 FIREBASE_PROJECT_ID=your-firebase-project
 ```
 
-Do not prefix secrets with `NEXT_PUBLIC_`. The manager does not need a seller API key or Cloudflare D1 token; it talks to the authenticated Worker manager endpoint.
+Do not prefix secrets with `NEXT_PUBLIC_`. The manager no longer needs a seller API key or direct Cloudflare D1 token; it talks to the authenticated Worker manager endpoint.
 
 ## Local checks
 

@@ -7,4 +7,5 @@ CREATE TABLE IF NOT EXISTS product_prices (
   PRIMARY KEY (product_key, variant_key)
 );
 
--- Add your own fixed prices after deployment, through the manager website or SQL.
+INSERT OR IGNORE INTO product_prices (product_key, variant_key, price_bdt, updated_by)
+VALUES ('gemini_18_month_link', '', 495, 7587079688);

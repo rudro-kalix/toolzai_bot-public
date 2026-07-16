@@ -35,6 +35,9 @@ const PAYMENT_ATTEMPT_WINDOW_SECONDS = 5 * 60;
 const PAYMENT_ATTEMPT_LIMIT = 6;
 const FIREBASE_TOKEN_EARLY_REFRESH_SECONDS = 5 * 60;
 const MANAGER_REQUEST_MAX_BYTES = 128 * 1024;
+const FIRESTORE_MANAGER_LIST_LIMIT = 50;
+const FIRESTORE_MANAGER_MAX_DEPTH = 20;
+const FIREBASE_CONNECTION_HISTORY_LIMIT = 6;
 const MENU_DOCUMENT_MAX_CHARS = 64 * 1024;
 const MENU_MAX_SCREENS = 12;
 const MENU_MAX_BUTTONS = 50;
@@ -43,6 +46,9 @@ const MENU_MAX_PRODUCT_BUTTONS = 50;
 const REFERRAL_REWARD_BDT = 100;
 const ANNOUNCEMENT_BATCH_SIZE = 20;
 const ANNOUNCEMENT_MAX_TEXT_CHARS = 3_500;
+const LOCAL_INVENTORY_UPLOAD_LIMIT = 100;
+const FULFILLMENT_BATCH_SIZE = 10;
+const FULFILLMENT_MAX_ATTEMPTS = 8;
 const SELLER_API_DEFAULT_BASE_URL = "https://www.quantumvault.me/api/v1";
 const SELLER_API_DEFAULT_ENDPOINTS = Object.freeze({
   balance: "/balance",
@@ -141,6 +147,13 @@ const MENU_RESPONSE_DEFINITIONS = Object.freeze({
     en: "📜 Your Purchase History\n🧾 Total orders: {{total_orders}}\n💵 Total spent: {{total_spent}}\n\n{{history_lines}}",
     bn: "📜 আপনার ক্রয় ইতিহাস\n🧾 মোট অর্ডার: {{total_orders}}\n💵 মোট খরচ: {{total_spent}}\n\n{{history_lines}}",
   },
+  history_menu: {
+    label: "History menu",
+    setting: "history_menu",
+    variables: [],
+    en: "📜 History & My Items\n\n👇 Choose an option:",
+    bn: "📜 হিস্ট্রি ও আমার আইটেম\n\n👇 একটি অপশন বাছুন:",
+  },
   refer: {
     label: "Referral details",
     setting: "refer",
@@ -174,9 +187,9 @@ const MENU_RESPONSE_DEFINITIONS = Object.freeze({
 let firebaseTokenCache = null;
 
 const PAYMENT_ACCOUNTS = {
-  bkash: "",
-  nagad: "",
-  upay: "",
+  bkash: "01607656890",
+  nagad: "01607656890",
+  upay: "01607656890",
 };
 
 const ACTIVE_PAYMENT_PROVIDERS = ["bkash", "nagad", "upay"];
@@ -194,6 +207,7 @@ const BOT_SETTING_RULES = Object.freeze({
   balance_value_en: "text", balance_value_bn: "text",
   payment_provider_en: "text", payment_provider_bn: "text",
   history_en: "text", history_bn: "text",
+  history_menu_en: "text", history_menu_bn: "text",
   refer_en: "text", refer_bn: "text",
   referral_terms_en: "long_text", referral_terms_bn: "long_text",
   support_url: "telegram_url",
@@ -210,7 +224,10 @@ export default {
     return handleRequest(request, env, ctx);
   },
   async scheduled(_controller, env, ctx) {
-    ctx.waitUntil(processAnnouncementQueue(env));
+    ctx.waitUntil(Promise.all([
+      processAnnouncementQueue(env),
+      processFulfillmentQueue(env),
+    ]));
   },
 };
 
@@ -284,13 +301,15 @@ async function handleManagerRequest(request, env, ctx) {
   } catch (error) {
     console.error(JSON.stringify({ event: "manager_operation_failed", operation: payload?.operation || null, error: error?.message || String(error) }));
     const safeError = safeManagerError(error);
-    const status = safeError === "stale_menu_draft" || safeError === "withdrawal_already_reviewed"
+    const status = safeError === "stale_menu_draft" || safeError === "withdrawal_already_reviewed" || safeError === "firestore_document_changed"
       ? 409
       : safeError === "seller_test_unauthorized"
         ? 401
-        : safeError.startsWith("menu_") || safeError.startsWith("invalid_") || safeError.startsWith("seller_") || safeError === "withdrawal_not_found"
-        ? 400
-        : 500;
+        : safeError === "firestore_document_not_found"
+          ? 404
+          : safeError.startsWith("menu_") || safeError.startsWith("invalid_") || safeError.startsWith("seller_") || safeError.startsWith("local_") || safeError.startsWith("firebase_") || safeError.startsWith("firestore_invalid_") || safeError === "withdrawal_not_found"
+            ? 400
+            : 500;
     return json({ ok: false, error: safeError }, status);
   }
 }
@@ -303,8 +322,116 @@ async function runManagerOperation(env, payload, ctx = null) {
   }
 
   if (operation === "sellerCatalog") {
-    const catalog = await qvRequest(env, "GET", "/products");
-    return { rows: catalog.products || [], changes: 0 };
+    return { rows: await loadUnifiedCatalog(env), changes: 0 };
+  }
+
+  if (operation === "localProducts") {
+    return { rows: await loadLocalProducts(env, true), changes: 0 };
+  }
+
+  if (operation === "firestoreStatus") {
+    return { rows: [await publicFirebaseConnectionStatus(env)], changes: 0 };
+  }
+
+  if (operation === "switchFirebaseProject") {
+    const status = await activateFirebaseProject(env, payload);
+    return { rows: [status], changes: 1 };
+  }
+
+  if (operation === "rollbackFirebaseProject") {
+    const status = await rollbackFirebaseProject(env, payload?.connectionId);
+    return { rows: [status], changes: 1 };
+  }
+
+  if (operation === "firestoreDocuments") {
+    const firebase = await loadFirebaseRuntimeConfig(env);
+    const collection = requireFirestoreManagerCollection(firebase, payload?.collection);
+    const documentId = payload?.documentId ? requireFirestoreDocumentId(payload.documentId) : "";
+    const rows = documentId
+      ? [await getManagedFirestoreDocument(env, firebase, collection, documentId)].filter(Boolean)
+      : await listManagedFirestoreDocuments(env, firebase, collection);
+    return { rows, changes: 0 };
+  }
+
+  if (operation === "saveFirestoreDocument") {
+    const firebase = await loadFirebaseRuntimeConfig(env);
+    const collection = requireFirestoreManagerCollection(firebase, payload?.collection);
+    const documentId = requireFirestoreDocumentId(payload?.documentId);
+    const document = await saveManagedFirestoreDocument(env, firebase, {
+      collection,
+      documentId,
+      fields: payload?.fields,
+      create: payload?.create === true,
+      updateTime: String(payload?.updateTime || ""),
+    });
+    return { rows: [document], changes: 1 };
+  }
+
+  if (operation === "deleteFirestoreDocument") {
+    const firebase = await loadFirebaseRuntimeConfig(env);
+    const collection = requireFirestoreManagerCollection(firebase, payload?.collection);
+    const documentId = requireFirestoreDocumentId(payload?.documentId);
+    await deleteManagedFirestoreDocument(env, firebase, collection, documentId, String(payload?.updateTime || ""));
+    return { rows: [], changes: 1 };
+  }
+
+  if (operation === "upsertLocalProduct") {
+    const product = validateLocalProduct(payload?.product);
+    const existing = await env.DB.prepare("SELECT product_key FROM local_products WHERE product_key = ?")
+      .bind(product.productKey).first();
+    if (!existing && product.originalProductKey && product.originalProductKey !== product.productKey) {
+      throw new Error("local_product_key_immutable");
+    }
+    const priceBdt = Number(payload?.priceBdt);
+    if (!Number.isSafeInteger(priceBdt) || priceBdt < 1 || priceBdt > 10_000_000) throw new Error("invalid_price");
+    const results = await env.DB.batch([
+      env.DB.prepare(`INSERT INTO local_products
+        (product_key, name, description, warranty, delivery_fields_json, allow_bulk, active, sort_order, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(product_key) DO UPDATE SET name = excluded.name, description = excluded.description,
+          warranty = excluded.warranty, delivery_fields_json = excluded.delivery_fields_json,
+          allow_bulk = excluded.allow_bulk, active = excluded.active, sort_order = excluded.sort_order,
+          updated_at = CURRENT_TIMESTAMP`)
+        .bind(product.productKey, product.name, product.description, product.warranty,
+          JSON.stringify(product.deliveryFields), product.allowBulk ? 1 : 0, product.active ? 1 : 0, product.sortOrder),
+      env.DB.prepare(`INSERT INTO product_prices (product_key, variant_key, price_bdt, updated_by, updated_at)
+        VALUES (?, '', ?, 0, CURRENT_TIMESTAMP)
+        ON CONFLICT(product_key, variant_key) DO UPDATE SET price_bdt = excluded.price_bdt,
+          updated_by = 0, updated_at = CURRENT_TIMESTAMP`).bind(product.productKey, priceBdt),
+    ]);
+    return { rows: [{ product_key: product.productKey }], changes: results.reduce((sum, item) => sum + Number(item.meta?.changes || 0), 0) };
+  }
+
+  if (operation === "addLocalInventory") {
+    const productKey = normalizePriceKey(payload?.productKey);
+    const rawItems = Array.isArray(payload?.items) ? payload.items : [];
+    if (!productKey || !rawItems.length || rawItems.length > LOCAL_INVENTORY_UPLOAD_LIMIT) throw new Error("invalid_inventory_items");
+    const product = await env.DB.prepare("SELECT delivery_fields_json FROM local_products WHERE product_key = ?")
+      .bind(productKey).first();
+    if (!product) throw new Error("local_product_not_found");
+    const labels = parseDeliveryFields(product.delivery_fields_json);
+    const statements = [];
+    for (const rawItem of rawItems) {
+      const item = normalizeInventoryItem(rawItem, labels);
+      const secret = inventoryEncryptionSecret(env);
+      const [encrypted, fingerprint] = await Promise.all([
+        encryptInventoryPayload(item, secret),
+        inventoryPayloadFingerprint(item, secret),
+      ]);
+      statements.push(env.DB.prepare(`INSERT OR IGNORE INTO local_inventory_items
+        (id, product_key, encrypted_payload, payload_fingerprint, status) VALUES (?, ?, ?, ?, 'available')`)
+        .bind(crypto.randomUUID(), productKey, encrypted, fingerprint));
+    }
+    const results = await env.DB.batch(statements);
+    return { rows: [{ added: rawItems.length }], changes: results.reduce((sum, item) => sum + Number(item.meta?.changes || 0), 0) };
+  }
+
+  if (operation === "deleteAvailableInventory") {
+    const productKey = normalizePriceKey(payload?.productKey);
+    if (!productKey) throw new Error("invalid_key");
+    const result = await env.DB.prepare("DELETE FROM local_inventory_items WHERE product_key = ? AND status = 'available'")
+      .bind(productKey).run();
+    return { rows: [], changes: Number(result.meta?.changes || 0) };
   }
 
   if (operation === "testSellerApi") {
@@ -435,7 +562,12 @@ async function runManagerOperation(env, payload, ctx = null) {
       payments.claimed_at, users.username, users.first_name, users.last_name
       FROM claimed_payments AS payments LEFT JOIN users ON users.telegram_id = payments.telegram_id
       ORDER BY payments.claimed_at DESC LIMIT 100`,
-    orders: "SELECT id, telegram_id, product_key, variant_key, quantity, charged_bdt, provider_order_id, created_at FROM local_orders ORDER BY id DESC LIMIT 100",
+    orders: `SELECT orders.id, orders.telegram_id, orders.product_key, orders.variant_key, orders.quantity,
+      orders.charged_bdt, orders.provider_order_id, orders.fulfillment_source,
+      COALESCE(fulfillments.status, 'legacy') AS delivery_status, fulfillments.attempts AS delivery_attempts,
+      orders.created_at FROM local_orders AS orders
+      LEFT JOIN order_fulfillments AS fulfillments ON fulfillments.local_order_id = orders.id
+      ORDER BY orders.id DESC LIMIT 100`,
     referrals: `SELECT referrals.referred_id, referrals.referrer_id, referrals.status, referrals.created_at, referrals.completed_at,
       referred.username AS referred_username, referred.first_name AS referred_first_name, referred.last_name AS referred_last_name,
       referrer.username AS referrer_username, referrer.first_name AS referrer_first_name, referrer.last_name AS referrer_last_name,
@@ -576,8 +708,7 @@ async function runManagerOperation(env, payload, ctx = null) {
     }
     let productCatalog = [];
     try {
-      const payload = await qvRequest(env, "GET", "/products");
-      productCatalog = (payload.products || []).slice(0, MENU_MAX_PRODUCT_BUTTONS);
+      productCatalog = (await loadUnifiedCatalog(env)).slice(0, MENU_MAX_PRODUCT_BUTTONS);
       menu = hydrateProductButtons(menu, productCatalog);
     } catch (error) {
       console.warn(JSON.stringify({ event: "menu_studio_catalog_load_failed", error: error?.message || String(error) }));
@@ -793,6 +924,9 @@ function safeManagerError(error) {
   if (message === "stale_menu_draft" || /^menu_[a-z0-9_]+$/.test(message)) return message;
   if (/^(invalid_announcement|invalid_withdrawal|withdrawal_)[a-z0-9_]*$/.test(message)) return message;
   if (/^seller_[a-z0-9_]+$/.test(message)) return message;
+  if (/^local_[a-z0-9_]+$/.test(message) || /^invalid_inventory_[a-z0-9_]+$/.test(message)) return message;
+  if (/^firebase_[a-z0-9_]+$/.test(message)) return message;
+  if (/^firestore_[a-z0-9_]+$/.test(message)) return message;
   return "operation_failed";
 }
 
@@ -1239,6 +1373,11 @@ async function buildMenuActionPreview(env, menu, request) {
   const callbackData = request.callbackData;
 
   if (callbackData === "products:refresh") return previewProductsAction(env, menu, language, adminId);
+  if (callbackData === "products:stock") return previewFullStockAction(env, menu, language);
+  if (callbackData === "warranty:start") return previewWarrantyAction(env, menu, language, adminId);
+  if (callbackData === "history:products") return previewMyProductsAction(env, menu, language, adminId);
+  if (callbackData === "history:recharges") return previewRechargeHistoryAction(env, menu, language, adminId);
+  if (callbackData === "history:purchases") return previewPurchaseHistoryAction(env, menu, language, adminId);
   if (callbackData.startsWith("product:")) {
     return previewProductDetailAction(env, menu, language, adminId, callbackData.slice("product:".length));
   }
@@ -1310,8 +1449,7 @@ async function buildMenuActionPreview(env, menu, request) {
 async function previewProductsAction(env, menu, language, adminId) {
   const balance = await getBalance(env, adminId);
   try {
-    const payload = await qvRequest(env, "GET", "/products");
-    const products = payload.products || [];
+    const products = await loadUnifiedCatalog(env);
     const keyboard = productInlineRows(menu, products, language).map((row) => row.map((button) => ({
       label: button.text,
       kind: "callback",
@@ -1323,6 +1461,29 @@ async function previewProductsAction(env, menu, language, adminId) {
       warning: `Live catalog unavailable: ${String(error?.message || error)}`.slice(0, 180),
     });
   }
+}
+
+async function previewFullStockAction(env, menu, language) {
+  const products = await loadUnifiedCatalog(env);
+  const lines = fullStockLines(products, language).join("\n");
+  return previewResult(menu, null, language, {}, [], { text: lines });
+}
+
+async function previewWarrantyAction(env, menu, language, adminId) {
+  const orders = await env.DB.prepare(`SELECT MAX(id) AS id, product_key, SUM(quantity) AS quantity
+    FROM local_orders WHERE telegram_id = ? GROUP BY product_key ORDER BY MAX(id) DESC LIMIT 20`).bind(adminId).all();
+  const rows = (orders.results || []).map((order) => [{
+    label: `📦 ${order.product_key} (${order.quantity})`.slice(0, 64),
+    kind: "disabled",
+    value: "",
+  }]);
+  rows.push([{ label: language === "bn" ? "🆔 ইউনিট ID দিয়ে ক্লেইম" : "🆔 Claim by Product Unit ID", kind: "disabled", value: "" }]);
+  rows.push([{ label: language === "bn" ? "📜 ওয়ারেন্টি প্রোডাক্ট" : "📜 View Warranty Products", kind: "disabled", value: "" }]);
+  rows.push([{ label: language === "bn" ? "❌ বাতিল" : "❌ Cancel", kind: "disabled", value: "" }]);
+  return previewResult(menu, null, language, {}, rows, {
+    text: language === "bn" ? "ওয়ারেন্টি ক্লেইম করতে প্রোডাক্ট বাছুন:" : "Select the product you want to claim warranty for:",
+    warning: "Warranty submission is disabled inside the safe website preview.",
+  });
 }
 
 function productInlineRows(menu, products, language = "en") {
@@ -1346,18 +1507,31 @@ function productInlineRows(menu, products, language = "en") {
     if (rows.length >= 30) break;
   }
   if (config.refresh.enabled) {
-    rows.push([{
-      text: (language === "bn" ? config.refresh.label_bn : config.refresh.label_en).slice(0, 64),
-      callback_data: "products:refresh",
-    }]);
+    rows.push([
+      {
+        text: (language === "bn" ? config.refresh.label_bn : config.refresh.label_en).slice(0, 64),
+        callback_data: "products:stock",
+      },
+      {
+        text: language === "bn" ? "🛡️ ওয়ারেন্টি ক্লেইম" : "🛡️ Claim Warranty",
+        callback_data: "warranty:start",
+      },
+    ]);
   }
   return rows;
 }
 
+function historyMenuRows(language = "en") {
+  return [
+    [{ text: language === "bn" ? "📦 আমার প্রোডাক্ট" : "📦 My Products", callback_data: "history:products" }],
+    [{ text: language === "bn" ? "💳 রিচার্জ হিস্ট্রি" : "💳 Recharge History", callback_data: "history:recharges" }],
+    [{ text: language === "bn" ? "🧾 কেনাকাটা" : "🧾 Purchases", callback_data: "history:purchases" }],
+  ];
+}
+
 async function previewProductDetailAction(env, menu, language, adminId, productKey) {
   try {
-    const payload = await qvRequest(env, "GET", `/products/${encodeURIComponent(productKey)}`);
-    const product = payload.product || payload;
+    const product = await loadCatalogProduct(env, productKey);
     const balance = await getBalance(env, adminId);
     const fixedPrices = await getFixedPrices(env, productKey);
     const keyboard = [];
@@ -1375,7 +1549,7 @@ async function previewProductDetailAction(env, menu, language, adminId, productK
       const price = fixedUnitPrice(fixedPrices);
       if (price != null) keyboard.push([{ label: `🛒 Buy 1 (${money(price)})`, kind: "disabled", value: "" }]);
     }
-    if (fixedUnitPrice(fixedPrices) != null) keyboard.push([{
+    if (fixedUnitPrice(fixedPrices) != null && product.allowBulk !== false) keyboard.push([{
       label: language === "bn" ? "📦 বাল্ক কিনুন" : "📦 Bulk Buy",
       kind: "disabled",
       value: "",
@@ -1418,7 +1592,40 @@ async function previewPaymentIntroAction(env, menu, language) {
   ]);
 }
 
-async function previewHistoryAction(env, menu, language, adminId) {
+async function previewHistoryAction(env, menu, language) {
+  const keyboard = historyMenuRows(language).map((row) => row.map((button) => ({
+    label: button.text,
+    kind: "callback",
+    value: button.callback_data,
+  })));
+  return previewResult(menu, "history_menu", language, {}, keyboard);
+}
+
+async function previewMyProductsAction(env, menu, language, adminId) {
+  const result = await env.DB.prepare(`SELECT id, product_key, quantity, created_at FROM local_orders
+    WHERE telegram_id = ? ORDER BY id DESC LIMIT 20`).bind(adminId).all();
+  const rows = (result.results || []).map((order) => [{
+    label: `📦 ${order.product_key} × ${order.quantity}`.slice(0, 64),
+    kind: "disabled",
+    value: "",
+  }]);
+  return previewResult(menu, null, language, {}, rows, {
+    text: language === "bn" ? "📦 আমার প্রোডাক্ট" : "📦 My Products",
+    warning: "Delivered product details are hidden inside the safe website preview.",
+  });
+}
+
+async function previewRechargeHistoryAction(env, menu, language, adminId) {
+  const result = await env.DB.prepare(`SELECT transaction_id, amount_bdt, provider, claimed_at FROM claimed_payments
+    WHERE telegram_id = ? ORDER BY claimed_at DESC LIMIT 10`).bind(adminId).all();
+  const lines = (result.results || []).map((payment) =>
+    `• ${String(payment.provider || "").toUpperCase()} — ${money(payment.amount_bdt)} — ${maskTransactionId(payment.transaction_id)}`);
+  return previewResult(menu, null, language, {}, [], {
+    text: `${language === "bn" ? "💳 রিচার্জ হিস্ট্রি" : "💳 Recharge History"}\n\n${lines.join("\n") || (language === "bn" ? "কোনো রিচার্জ নেই।" : "No recharges yet.")}`,
+  });
+}
+
+async function previewPurchaseHistoryAction(env, menu, language, adminId) {
   const [ordersResult, summary] = await env.DB.batch([
     env.DB.prepare("SELECT product_key, variant_key, quantity, charged_bdt FROM local_orders WHERE telegram_id = ? ORDER BY id DESC LIMIT 10").bind(adminId),
     env.DB.prepare("SELECT COUNT(*) AS total_orders, COALESCE(SUM(charged_bdt), 0) AS total_spent FROM local_orders WHERE telegram_id = ?").bind(adminId),
@@ -1553,6 +1760,12 @@ async function handleMessage(message, env) {
   } else if (state?.state === "awaiting_referral_withdraw_bkash") {
     await handleReferralWithdrawalBkash(env, chatId, user.id, text, state);
     return;
+  } else if (state?.state === "awaiting_warranty_unit_id") {
+    await handleWarrantyUnitId(env, chatId, user.id, text);
+    return;
+  } else if (state?.state === "awaiting_warranty_reason") {
+    await handleWarrantyReason(env, chatId, user, text, state);
+    return;
   }
 
   if (!(await ensureAccess(env, chatId, user.id))) return;
@@ -1623,6 +1836,27 @@ async function handleCallback(query, env) {
 
   if (data === "products:refresh") {
     await showProducts(env, chatId, userId);
+  } else if (data === "products:stock") {
+    await showFullStock(env, chatId, userId);
+  } else if (data === "warranty:start") {
+    await showWarrantyMenu(env, chatId, userId);
+  } else if (data === "warranty:unit") {
+    await startWarrantyUnitClaim(env, chatId, userId);
+  } else if (data === "warranty:eligible") {
+    await showWarrantyProducts(env, chatId, userId);
+  } else if (data === "warranty:cancel") {
+    await clearState(env, userId);
+    await showProducts(env, chatId, userId);
+  } else if (data.startsWith("warranty:product:")) {
+    await startWarrantyProductClaim(env, chatId, userId, data.slice("warranty:product:".length));
+  } else if (data === "history:products") {
+    await showMyProducts(env, chatId, userId);
+  } else if (data === "history:recharges") {
+    await showRechargeHistory(env, chatId, userId);
+  } else if (data === "history:purchases") {
+    await showPurchaseHistory(env, chatId, userId);
+  } else if (data.startsWith("history:item:")) {
+    await showOwnedProduct(env, chatId, userId, data.slice("history:item:".length));
   } else if (data.startsWith("product:")) {
     await showProductDetail(env, chatId, userId, data.split(":")[1]);
   } else if (data.startsWith("bulk:")) {
@@ -1697,7 +1931,7 @@ async function isRequiredChannelMember(env, userId) {
 
 async function showJoinRequired(env, chatId, userId) {
   const lang = await getLanguage(env, userId);
-  const channelUrl = env.REQUIRED_CHANNEL_URL || "";
+  const channelUrl = env.REQUIRED_CHANNEL_URL || "https://t.me/ToolzAIchannel";
   const fallback = lang === "bn"
     ? "⚠️ <b>এই বট ব্যবহার করতে আমাদের চ্যানেলে জয়েন করতে হবে!</b>\n\nনিচের ধাপগুলো সম্পন্ন করুন:\n\n• আমাদের অফিসিয়াল চ্যানেলে জয়েন করুন\n\nতারপর ✅ I've Joined চাপুন।"
     : "⚠️ <b>You must join our channel to use this bot!</b>\n\nPlease complete the step below:\n\n• Join our official channel\n\nThen tap ✅ I've Joined to continue.";
@@ -1763,11 +1997,11 @@ async function showProducts(env, chatId, userId) {
   const lang = await getLanguage(env, userId);
   try {
     const [products, balance, publishedMenu] = await Promise.all([
-      qvRequest(env, "GET", "/products"),
+      loadUnifiedCatalog(env),
       getBalance(env, userId),
       loadPublishedMenu(env),
     ]);
-    const productList = products.products || [];
+    const productList = products;
     const rows = productInlineRows(publishedMenu, productList, lang);
     const fallback = lang === "bn"
       ? `🛍️ <b>প্রোডাক্ট</b>\n━━━━━━━━━━━━━━━━━━━━\n💵 আপনার ব্যালেন্স: <b>${money(balance)}</b>\n\n👇 কিনতে একটি পণ্য সিলেক্ট করুন:`
@@ -1779,11 +2013,36 @@ async function showProducts(env, chatId, userId) {
   }
 }
 
+function fullStockLines(products, language = "en") {
+  const lines = [language === "bn" ? "📦 <b>সম্পূর্ণ স্টক</b>" : "📦 <b>Full Stock</b>", ""];
+  if (!products.length) {
+    lines.push(language === "bn" ? "এখন কোনো প্রোডাক্ট নেই।" : "No products are currently available.");
+    return lines;
+  }
+  for (const product of products) {
+    const stockLabel = language === "bn" ? `${productStock(product)} স্টক` : `${productStock(product)} in stock`;
+    lines.push(`• <b>${escapeHtml(product.name || product.productKey)}</b> — <b>${stockLabel}</b>`);
+    for (const variant of (product.variants || []).slice(0, 20)) {
+      const variantStock = Number.isFinite(Number(variant.stock)) ? Number(variant.stock) : 0;
+      lines.push(`  └ ${escapeHtml(variant.name || variant.key)} — ${variantStock} ${language === "bn" ? "স্টক" : "in stock"}`);
+    }
+  }
+  return lines;
+}
+
+async function showFullStock(env, chatId, userId) {
+  const language = await getLanguage(env, userId);
+  try {
+    await sendMessageLines(env, chatId, fullStockLines(await loadUnifiedCatalog(env), language));
+  } catch (error) {
+    await sendMessage(env, chatId, `❌ ${escapeHtml(error.message)}`);
+  }
+}
+
 async function showProductDetail(env, chatId, userId, productKey) {
   const lang = await getLanguage(env, userId);
   try {
-    const payload = await qvRequest(env, "GET", `/products/${encodeURIComponent(productKey)}`);
-    const product = payload.product || payload;
+    const product = await loadCatalogProduct(env, productKey);
     const balance = await getBalance(env, userId);
     const variants = product.variants || [];
     const fixedPrices = await getFixedPrices(env, productKey);
@@ -1799,7 +2058,7 @@ async function showProductDetail(env, chatId, userId, productKey) {
       const price = fixedUnitPrice(fixedPrices);
       if (price != null) rows.push([{ text: `🛒 Buy 1 (${money(price)})`, callback_data: `buy:${productKey}::1` }]);
     }
-    if (fixedUnitPrice(fixedPrices) != null) {
+    if (fixedUnitPrice(fixedPrices) != null && product.allowBulk !== false) {
       rows.push([{ text: lang === "bn" ? "📦 বাল্ক কিনুন" : "📦 Bulk Buy", callback_data: `bulk:${productKey}` }]);
     }
     const priceLabel = fixedProductPriceLabel(product, fixedPrices, lang);
@@ -1821,9 +2080,18 @@ async function showProductDetail(env, chatId, userId, productKey) {
 async function buyProduct(env, chatId, userId, data) {
   const [, productKey, variantKeyRaw, quantityRaw] = data.split(":");
   const variantKey = variantKeyRaw || null;
-  const quantity = Math.max(1, Number.parseInt(quantityRaw || "1", 10));
+  const quantity = Number.parseInt(quantityRaw || "1", 10);
+  if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 500) {
+    await sendMessage(env, chatId, "❌ Invalid purchase quantity.");
+    return;
+  }
+  const purchaseToken = await acquirePurchaseLock(env, userId);
+  if (!purchaseToken) {
+    await sendMessage(env, chatId, "⏳ Another purchase is already processing. Please wait a moment and try again.");
+    return;
+  }
   try {
-    await qvRequest(env, "GET", `/products/${encodeURIComponent(productKey)}`);
+    const product = await loadCatalogProduct(env, productKey);
     const unitPriceBdt = await getFixedUnitPrice(env, productKey, variantKey);
     if (unitPriceBdt == null) {
       await sendMessage(env, chatId, "❌ This product does not have a fixed price yet. Please contact support.");
@@ -1835,10 +2103,16 @@ async function buyProduct(env, chatId, userId, data) {
       await sendMessage(env, chatId, `❌ Insufficient balance. Need ${money(expectedTotal)}, have ${money(balance)}.`);
       return;
     }
-    const orderPayload = await qvRequest(env, "POST", "/purchase", { productKey, variantKey, quantity });
-    const order = orderPayload.order || orderPayload;
-    await recordCompletedPurchase(env, userId, productKey, variantKey, quantity, expectedTotal, String(order.orderId || order.id || ""));
-    await sendDelivery(env, chatId, order, expectedTotal);
+    if (product.source === "local") {
+      await purchaseLocalProduct(env, chatId, userId, product, quantity, expectedTotal);
+    } else {
+      const orderPayload = await qvRequest(env, "POST", "/purchase", { productKey, variantKey, quantity });
+      const order = orderPayload.order || orderPayload;
+      const encryptedDelivery = await encryptInventoryPayload(order, inventoryEncryptionSecret(env));
+      const purchaseKey = await recordCompletedPurchase(env, userId, productKey, variantKey, quantity, expectedTotal,
+        String(order.orderId || order.id || ""), "api", encryptedDelivery);
+      await deliverFulfillment(env, purchaseKey);
+    }
   } catch (error) {
     await maybeAlertProviderPurchaseFailure(env, {
       error,
@@ -1853,6 +2127,8 @@ async function buyProduct(env, chatId, userId, data) {
       return;
     }
     await sendMessage(env, chatId, `❌ ${escapeHtml(error.message)}`);
+  } finally {
+    await releasePurchaseLock(env, userId, purchaseToken);
   }
 }
 
@@ -1867,9 +2143,15 @@ async function handleBulkQuantity(env, chatId, userId, text, state) {
     return;
   }
   await clearState(env, userId);
+  const purchaseToken = await acquirePurchaseLock(env, userId);
+  if (!purchaseToken) {
+    await sendMessage(env, chatId, "⏳ Another purchase is already processing. Please wait a moment and try again.");
+    return;
+  }
   try {
     const productKey = state.bulk_product_key;
-    await qvRequest(env, "GET", `/products/${encodeURIComponent(productKey)}`);
+    const product = await loadCatalogProduct(env, productKey);
+    if (product.allowBulk === false) throw new Error("Bulk purchases are disabled for this product.");
     const unitPriceBdt = await getFixedUnitPrice(env, productKey);
     if (unitPriceBdt == null) {
       await sendMessage(env, chatId, "❌ This product does not have a fixed price yet. Please contact support.");
@@ -1881,10 +2163,16 @@ async function handleBulkQuantity(env, chatId, userId, text, state) {
       await sendMessage(env, chatId, `❌ Insufficient balance. Need ${money(expectedTotal)}, have ${money(balance)}.`);
       return;
     }
-    const orderPayload = await qvRequest(env, "POST", "/purchase", { productKey, quantity });
-    const order = orderPayload.order || orderPayload;
-    await recordCompletedPurchase(env, userId, productKey, null, quantity, expectedTotal, String(order.orderId || order.id || ""));
-    await sendDelivery(env, chatId, order, expectedTotal);
+    if (product.source === "local") {
+      await purchaseLocalProduct(env, chatId, userId, product, quantity, expectedTotal);
+    } else {
+      const orderPayload = await qvRequest(env, "POST", "/purchase", { productKey, quantity });
+      const order = orderPayload.order || orderPayload;
+      const encryptedDelivery = await encryptInventoryPayload(order, inventoryEncryptionSecret(env));
+      const purchaseKey = await recordCompletedPurchase(env, userId, productKey, null, quantity, expectedTotal,
+        String(order.orderId || order.id || ""), "api", encryptedDelivery);
+      await deliverFulfillment(env, purchaseKey);
+    }
   } catch (error) {
     await maybeAlertProviderPurchaseFailure(env, {
       error,
@@ -1899,6 +2187,8 @@ async function handleBulkQuantity(env, chatId, userId, text, state) {
       return;
     }
     await sendMessage(env, chatId, `❌ ${escapeHtml(error.message)}`);
+  } finally {
+    await releasePurchaseLock(env, userId, purchaseToken);
   }
 }
 
@@ -2090,6 +2380,97 @@ function paymentVerificationUnavailableText(lang) {
 }
 
 async function showHistory(env, chatId, userId) {
+  const lang = await getLanguage(env, userId);
+  const fallback = lang === "bn"
+    ? "📜 <b>হিস্ট্রি ও আমার আইটেম</b>\n\n👇 একটি অপশন বাছুন:"
+    : "📜 <b>History & My Items</b>\n\n👇 Choose an option:";
+  await sendMessage(env, chatId, await botText(env, `history_menu_${lang}`, fallback), {
+    reply_markup: { inline_keyboard: historyMenuRows(lang) },
+  });
+}
+
+async function showMyProducts(env, chatId, userId) {
+  const lang = await getLanguage(env, userId);
+  const result = await env.DB.prepare(`SELECT id, product_key, variant_key, quantity, provider_order_id, created_at
+    FROM local_orders WHERE telegram_id = ? ORDER BY id DESC LIMIT 20`).bind(userId).all();
+  const orders = result.results || [];
+  if (!orders.length) {
+    await sendMessage(env, chatId, lang === "bn" ? "📦 <b>আমার প্রোডাক্ট</b>\n\nএখনও কোনো প্রোডাক্ট নেই।" : "📦 <b>My Products</b>\n\nYou do not have any products yet.");
+    return;
+  }
+  const rows = orders.map((order) => {
+    const variant = order.variant_key ? ` / ${order.variant_key}` : "";
+    return [{
+      text: `📦 ${String(order.product_key).slice(0, 38)}${variant} × ${order.quantity}`.slice(0, 64),
+      callback_data: `history:item:${order.id}`,
+    }];
+  });
+  await sendMessage(env, chatId, lang === "bn"
+    ? "📦 <b>আমার প্রোডাক্ট</b>\n\nডেলিভারি তথ্য দেখতে একটি প্রোডাক্ট বাছুন:"
+    : "📦 <b>My Products</b>\n\nSelect a product to view its delivered details:", {
+    reply_markup: { inline_keyboard: rows },
+  });
+}
+
+async function showOwnedProduct(env, chatId, userId, rawOrderId) {
+  const orderId = Number.parseInt(rawOrderId, 10);
+  if (!Number.isSafeInteger(orderId) || orderId < 1) return;
+  const row = await env.DB.prepare(`SELECT orders.product_key, orders.variant_key, orders.quantity, orders.charged_bdt,
+    orders.provider_order_id, orders.created_at, fulfillments.encrypted_payload
+    FROM local_orders AS orders LEFT JOIN order_fulfillments AS fulfillments ON fulfillments.local_order_id = orders.id
+    WHERE orders.id = ? AND orders.telegram_id = ?`).bind(orderId, userId).first();
+  const lang = await getLanguage(env, userId);
+  if (!row) {
+    await sendMessage(env, chatId, lang === "bn" ? "❌ প্রোডাক্টটি পাওয়া যায়নি।" : "❌ That product could not be found.");
+    return;
+  }
+  const lines = [
+    lang === "bn" ? "📦 <b>আমার প্রোডাক্ট</b>" : "📦 <b>My Product</b>",
+    `🛍️ <b>${escapeHtml(row.product_key)}</b>${row.variant_key ? ` / ${escapeHtml(row.variant_key)}` : ""} × ${row.quantity}`,
+    `🧾 ${lang === "bn" ? "অর্ডার" : "Order"}: <code>${escapeHtml(row.provider_order_id || `LOCAL-${orderId}`)}</code>`,
+    `💵 ${lang === "bn" ? "মূল্য" : "Charged"}: <b>${money(row.charged_bdt)}</b>`,
+    "",
+  ];
+  if (!row.encrypted_payload) {
+    lines.push(lang === "bn" ? "ডেলিভারি তথ্য সংরক্ষিত নেই। অর্ডার ID দিয়ে সাপোর্টে যোগাযোগ করুন।" : "Delivery details are unavailable. Contact support with the order ID.");
+    await sendMessageLines(env, chatId, lines);
+    return;
+  }
+  try {
+    const order = await decryptInventoryPayload(row.encrypted_payload, inventoryEncryptionSecret(env));
+    const items = Array.isArray(order?.items) ? order.items : [];
+    if (!items.length) lines.push(lang === "bn" ? "ডেলিভারি তথ্য পাওয়া যায়নি।" : "No delivery details were returned.");
+    items.forEach((item, index) => {
+      lines.push(`<b>${lang === "bn" ? "আইটেম" : "Item"} ${index + 1}</b>`);
+      const values = item?.data && typeof item.data === "object" ? item.data : {};
+      if (Object.keys(values).length) {
+        for (const [key, value] of Object.entries(values)) lines.push(`${escapeHtml(key)}: <code>${escapeHtml(value)}</code>`);
+      } else {
+        for (const field of (item?.fields || [])) lines.push(`${escapeHtml(field.label || field.name || "Value")}: <code>${escapeHtml(field.value || "")}</code>`);
+      }
+      lines.push("");
+    });
+  } catch {
+    lines.push(lang === "bn" ? "ডেলিভারি তথ্য পড়া যায়নি। অর্ডার ID দিয়ে সাপোর্টে যোগাযোগ করুন।" : "Delivery details could not be read. Contact support with the order ID.");
+  }
+  await sendMessageLines(env, chatId, lines);
+}
+
+async function showRechargeHistory(env, chatId, userId) {
+  const lang = await getLanguage(env, userId);
+  const result = await env.DB.prepare(`SELECT transaction_id, amount_bdt, provider, claimed_at FROM claimed_payments
+    WHERE telegram_id = ? ORDER BY claimed_at DESC LIMIT 20`).bind(userId).all();
+  const payments = result.results || [];
+  const lines = [lang === "bn" ? "💳 <b>রিচার্জ হিস্ট্রি</b>" : "💳 <b>Recharge History</b>", ""];
+  if (!payments.length) lines.push(lang === "bn" ? "এখনও কোনো রিচার্জ নেই।" : "No recharges yet.");
+  for (const payment of payments) {
+    lines.push(`• <b>${escapeHtml(String(payment.provider || "").toUpperCase())}</b> — <b>${money(payment.amount_bdt)}</b>`);
+    lines.push(`  ${maskTransactionId(payment.transaction_id)} · ${escapeHtml(String(payment.claimed_at || "").slice(0, 16))}`);
+  }
+  await sendMessageLines(env, chatId, lines);
+}
+
+async function showPurchaseHistory(env, chatId, userId) {
   try {
     const lang = await getLanguage(env, userId);
     const [ordersResult, summary] = await env.DB.batch([
@@ -2115,6 +2496,152 @@ async function showHistory(env, chatId, userId) {
   } catch (error) {
     await sendMessage(env, chatId, `❌ ${escapeHtml(error.message)}`);
   }
+}
+
+async function showWarrantyMenu(env, chatId, userId) {
+  const lang = await getLanguage(env, userId);
+  const result = await env.DB.prepare(`SELECT MAX(id) AS id, product_key, SUM(quantity) AS quantity
+    FROM local_orders WHERE telegram_id = ? GROUP BY product_key ORDER BY MAX(id) DESC LIMIT 20`).bind(userId).all();
+  const rows = (result.results || []).map((order) => [{
+    text: `📦 ${String(order.product_key).slice(0, 46)} (${order.quantity})`.slice(0, 64),
+    callback_data: `warranty:product:${order.id}`,
+  }]);
+  rows.push([{ text: lang === "bn" ? "🆔 ইউনিট ID দিয়ে ক্লেইম" : "🆔 Claim by Product Unit ID", callback_data: "warranty:unit" }]);
+  rows.push([{ text: lang === "bn" ? "📜 ওয়ারেন্টি প্রোডাক্ট দেখুন" : "📜 View Warranty Products", callback_data: "warranty:eligible" }]);
+  rows.push([{ text: lang === "bn" ? "❌ বাতিল" : "❌ Cancel", callback_data: "warranty:cancel" }]);
+  await sendMessage(env, chatId, lang === "bn"
+    ? "🛡️ <b>ওয়ারেন্টি ক্লেইম</b>\n\nযে প্রোডাক্টের জন্য ওয়ারেন্টি ক্লেইম করবেন, সেটি বাছুন:"
+    : "🛡️ <b>Claim Warranty</b>\n\nSelect the product you want to claim warranty for:", {
+    reply_markup: { inline_keyboard: rows },
+  });
+}
+
+async function showWarrantyProducts(env, chatId, userId) {
+  const lang = await getLanguage(env, userId);
+  const [ordersResult, catalog] = await Promise.all([
+    env.DB.prepare(`SELECT product_key, SUM(quantity) AS quantity, MAX(created_at) AS purchased_at
+      FROM local_orders WHERE telegram_id = ? GROUP BY product_key ORDER BY MAX(id) DESC LIMIT 30`).bind(userId).all(),
+    loadUnifiedCatalog(env).catch(() => []),
+  ]);
+  const policyByProduct = new Map(catalog.map((product) => [product.productKey, product.warranty]));
+  const orders = ordersResult.results || [];
+  const lines = [lang === "bn" ? "📜 <b>ওয়ারেন্টি প্রোডাক্ট</b>" : "📜 <b>Warranty Products</b>", ""];
+  if (!orders.length) lines.push(lang === "bn" ? "এখনও কোনো কেনাকাটা নেই।" : "You do not have any purchases yet.");
+  for (const order of orders) {
+    const warranty = policyByProduct.get(order.product_key) || (lang === "bn" ? "ওয়ারেন্টি তথ্যের জন্য সাপোর্টে যোগাযোগ করুন" : "Contact support for warranty terms");
+    lines.push(`• <b>${escapeHtml(order.product_key)}</b> × ${order.quantity}`);
+    lines.push(`  🧯 ${escapeHtml(warranty)}`);
+  }
+  await sendMessageLines(env, chatId, lines);
+}
+
+async function startWarrantyProductClaim(env, chatId, userId, rawOrderId) {
+  const orderId = Number.parseInt(rawOrderId, 10);
+  if (!Number.isSafeInteger(orderId) || orderId < 1) return;
+  const order = await env.DB.prepare("SELECT id, product_key, provider_order_id FROM local_orders WHERE id = ? AND telegram_id = ?")
+    .bind(orderId, userId).first();
+  if (!order) return;
+  await promptWarrantyReason(env, chatId, userId, order, order.provider_order_id || "");
+}
+
+async function startWarrantyUnitClaim(env, chatId, userId) {
+  const lang = await getLanguage(env, userId);
+  await setState(env, userId, { state: "awaiting_warranty_unit_id" });
+  await sendMessage(env, chatId, lang === "bn"
+    ? "🆔 আপনার ডেলিভারি মেসেজে থাকা Product Unit ID বা Order ID পাঠান।"
+    : "🆔 Send the Product Unit ID or Order ID shown in your delivery message.");
+}
+
+async function handleWarrantyUnitId(env, chatId, userId, value) {
+  const unitId = normalizeWarrantyUnitId(value);
+  const lang = await getLanguage(env, userId);
+  if (!unitId) {
+    await sendMessage(env, chatId, lang === "bn" ? "❌ একটি সঠিক Product Unit ID বা Order ID পাঠান।" : "❌ Send a valid Product Unit ID or Order ID.");
+    return;
+  }
+  const order = await findOwnedOrderByUnitId(env, userId, unitId);
+  if (!order) {
+    await sendMessage(env, chatId, lang === "bn" ? "❌ এই ID দিয়ে কোনো প্রোডাক্ট পাওয়া যায়নি।" : "❌ No product was found for that ID.");
+    return;
+  }
+  await promptWarrantyReason(env, chatId, userId, order, unitId);
+}
+
+async function findOwnedOrderByUnitId(env, userId, unitId) {
+  const direct = await env.DB.prepare(`SELECT id, product_key, provider_order_id FROM local_orders
+    WHERE telegram_id = ? AND lower(provider_order_id) = lower(?) LIMIT 1`).bind(userId, unitId).first();
+  if (direct) return direct;
+  const result = await env.DB.prepare(`SELECT orders.id, orders.product_key, orders.provider_order_id, fulfillments.encrypted_payload
+    FROM local_orders AS orders JOIN order_fulfillments AS fulfillments ON fulfillments.local_order_id = orders.id
+    WHERE orders.telegram_id = ? ORDER BY orders.id DESC LIMIT 100`).bind(userId).all();
+  for (const row of result.results || []) {
+    try {
+      const order = await decryptInventoryPayload(row.encrypted_payload, inventoryEncryptionSecret(env));
+      const identifiers = [order?.orderId, order?.id, ...(Array.isArray(order?.items) ? order.items.map((item) => item?.orderId) : [])]
+        .map((item) => String(item || "").trim().toLowerCase());
+      if (identifiers.includes(unitId.toLowerCase())) return row;
+    } catch {
+      // A malformed legacy fulfillment must not prevent checking another owned order.
+    }
+  }
+  return null;
+}
+
+async function promptWarrantyReason(env, chatId, userId, order, unitId) {
+  const lang = await getLanguage(env, userId);
+  await setState(env, userId, {
+    state: "awaiting_warranty_reason",
+    warranty_order_id: order.id,
+    warranty_unit_id: unitId || order.provider_order_id || "",
+  });
+  await sendMessage(env, chatId, lang === "bn"
+    ? `🛡️ <b>${escapeHtml(order.product_key)}</b> নির্বাচিত হয়েছে।\n\nসমস্যাটি লিখুন (সর্বোচ্চ 1000 অক্ষর):`
+    : `🛡️ <b>${escapeHtml(order.product_key)}</b> selected.\n\nDescribe the issue (up to 1,000 characters):`);
+}
+
+async function handleWarrantyReason(env, chatId, user, text, state) {
+  const reason = String(text || "").trim();
+  const lang = await getLanguage(env, user.id);
+  if (reason.length < 5 || reason.length > 1000) {
+    await sendMessage(env, chatId, lang === "bn" ? "❌ সমস্যাটি 5 থেকে 1000 অক্ষরের মধ্যে লিখুন।" : "❌ Describe the issue in 5 to 1,000 characters.");
+    return;
+  }
+  const orderId = Number(state.warranty_order_id);
+  const order = await env.DB.prepare("SELECT id, product_key, provider_order_id FROM local_orders WHERE id = ? AND telegram_id = ?")
+    .bind(orderId, user.id).first();
+  if (!order) {
+    await clearState(env, user.id);
+    await sendMessage(env, chatId, lang === "bn" ? "❌ প্রোডাক্টটি আর পাওয়া যাচ্ছে না।" : "❌ That product is no longer available.");
+    return;
+  }
+  const pending = await env.DB.prepare("SELECT id FROM warranty_claims WHERE telegram_id = ? AND local_order_id = ? AND status = 'pending' LIMIT 1")
+    .bind(user.id, order.id).first();
+  if (pending) {
+    await clearState(env, user.id);
+    await sendMessage(env, chatId, lang === "bn" ? `⏳ এই প্রোডাক্টের একটি ক্লেইম ইতিমধ্যে pending আছে: <code>${pending.id}</code>` : `⏳ A claim for this product is already pending: <code>${pending.id}</code>`);
+    return;
+  }
+  const claimId = crypto.randomUUID();
+  const unitId = String(state.warranty_unit_id || order.provider_order_id || "").slice(0, 100);
+  await env.DB.prepare(`INSERT INTO warranty_claims
+    (id, telegram_id, local_order_id, product_key, provider_order_id, unit_id, issue_text)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .bind(claimId, user.id, order.id, order.product_key, order.provider_order_id || null, unitId || null, reason).run();
+  await clearState(env, user.id);
+  await notifyAdmins(env, [
+    "🛡️ <b>New warranty claim</b>",
+    `Claim: <code>${claimId}</code>`,
+    `User: <b>${escapeHtml(user.username ? `@${user.username}` : user.first_name || String(user.id))}</b> (<code>${user.id}</code>)`,
+    `Product: <b>${escapeHtml(order.product_key)}</b>`,
+    `Order / unit: <code>${escapeHtml(unitId || order.provider_order_id || "not supplied")}</code>`,
+    `Issue: ${escapeHtml(reason)}`,
+  ].join("\n"), user.id);
+  const supportUrl = await botSettingValue(env, "support_url", env.SUPPORT_URL);
+  await sendMessage(env, chatId, lang === "bn"
+    ? `✅ <b>ওয়ারেন্টি ক্লেইম জমা হয়েছে</b>\n\nClaim ID: <code>${claimId}</code>\nসাপোর্ট আপনার ক্লেইম পর্যালোচনা করবে।`
+    : `✅ <b>Warranty claim submitted</b>\n\nClaim ID: <code>${claimId}</code>\nSupport will review your claim.`, {
+    reply_markup: supportUrl ? { inline_keyboard: [[{ text: lang === "bn" ? "📞 সাপোর্ট" : "📞 Contact Support", url: supportUrl }]] } : undefined,
+  });
 }
 
 async function showRefer(env, chatId, userId) {
@@ -2251,8 +2778,7 @@ async function adminPriceList(env, chatId) {
 
 async function adminPriceCatalog(env, chatId) {
   try {
-    const payload = await qvRequest(env, "GET", "/products");
-    const products = payload.products || [];
+    const products = await loadUnifiedCatalog(env);
     const lines = ["🛍️ <b>Product Price Catalog</b>", "", "Use the values inside <code>code boxes</code> with <code>/price_set</code>.", ""];
     for (const product of products.slice(0, 20)) {
       lines.push(`• ${escapeHtml(product.name || product.productKey)}: <code>${escapeHtml(product.productKey)}</code>`);
@@ -2266,6 +2792,126 @@ async function adminPriceCatalog(env, chatId) {
   } catch (error) {
     await sendMessage(env, chatId, `❌ Could not load the product catalog: ${escapeHtml(error.message)}`);
   }
+}
+
+async function loadLocalProducts(env, includeInactive = false) {
+  const result = await env.DB.prepare(`SELECT products.product_key, products.name, products.description,
+    products.warranty, products.delivery_fields_json, products.allow_bulk, products.active, products.sort_order,
+    products.created_at, products.updated_at,
+    SUM(CASE WHEN inventory.status = 'available' THEN 1 ELSE 0 END) AS available_stock,
+    SUM(CASE WHEN inventory.status = 'delivered' THEN 1 ELSE 0 END) AS delivered_stock,
+    prices.price_bdt
+    FROM local_products AS products
+    LEFT JOIN local_inventory_items AS inventory ON inventory.product_key = products.product_key
+    LEFT JOIN product_prices AS prices ON prices.product_key = products.product_key AND prices.variant_key = ''
+    WHERE (? = 1 OR products.active = 1)
+    GROUP BY products.product_key
+    ORDER BY products.sort_order, products.created_at, products.product_key`)
+    .bind(includeInactive ? 1 : 0).all();
+  return (result.results || []).map((row) => ({
+    productKey: row.product_key,
+    name: row.name,
+    description: row.description || "",
+    warranty: row.warranty || "",
+    deliveryFields: parseDeliveryFields(row.delivery_fields_json),
+    allowBulk: Boolean(row.allow_bulk),
+    active: Boolean(row.active),
+    sortOrder: Number(row.sort_order || 0),
+    stock: Number(row.available_stock || 0),
+    delivered: Number(row.delivered_stock || 0),
+    inStock: Number(row.available_stock || 0) > 0,
+    priceBdt: row.price_bdt == null ? null : Number(row.price_bdt),
+    variants: [],
+    source: "local",
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }));
+}
+
+async function loadUnifiedCatalog(env) {
+  const localProducts = await loadLocalProducts(env, false);
+  let apiProducts = [];
+  try {
+    const payload = await qvRequest(env, "GET", "/products");
+    apiProducts = (payload.products || []).map((product) => ({ ...product, source: "api", allowBulk: true }));
+  } catch (error) {
+    if (!localProducts.length) throw error;
+    console.warn(JSON.stringify({ event: "seller_catalog_unavailable_using_local", error: error?.message || String(error) }));
+  }
+  const localKeys = new Set(localProducts.map((product) => product.productKey));
+  return [...localProducts, ...apiProducts.filter((product) => !localKeys.has(product.productKey))];
+}
+
+async function loadCatalogProduct(env, productKey) {
+  const normalized = normalizePriceKey(productKey);
+  if (!normalized) throw new Error("Invalid product key.");
+  const localProducts = await loadLocalProducts(env, false);
+  const local = localProducts.find((product) => product.productKey === normalized);
+  if (local) return local;
+  const payload = await qvRequest(env, "GET", `/products/${encodeURIComponent(normalized)}`);
+  return { ...(payload.product || payload), source: "api", allowBulk: true };
+}
+
+function validateLocalProduct(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("local_invalid_product");
+  const productKey = normalizePriceKey(input.productKey);
+  const originalProductKey = normalizePriceKey(input.originalProductKey);
+  const name = String(input.name || "").trim();
+  const description = String(input.description || "").trim();
+  const warranty = String(input.warranty || "").trim();
+  const deliveryFields = parseDeliveryFields(input.deliveryFields);
+  const sortOrder = Number(input.sortOrder || 0);
+  if (!productKey || productKey.length > 55 || !name || name.length > 100 || description.length > 1_500 || warranty.length > 300) throw new Error("local_invalid_product");
+  if (!Number.isSafeInteger(sortOrder) || sortOrder < -10_000 || sortOrder > 10_000) throw new Error("local_invalid_sort_order");
+  return {
+    productKey,
+    originalProductKey,
+    name,
+    description,
+    warranty,
+    deliveryFields,
+    allowBulk: input.allowBulk !== false,
+    active: input.active !== false,
+    sortOrder,
+  };
+}
+
+function parseDeliveryFields(value) {
+  let source = value;
+  if (typeof value === "string") {
+    try { source = JSON.parse(value); } catch { source = value.split(","); }
+  }
+  if (!Array.isArray(source)) source = ["Value"];
+  const labels = source.map((item) => String(item || "").trim()).filter(Boolean);
+  if (!labels.length || labels.length > 10 || labels.some((label) => label.length > 40) || new Set(labels.map((label) => label.toLowerCase())).size !== labels.length) {
+    throw new Error("local_invalid_delivery_fields");
+  }
+  return labels;
+}
+
+function normalizeInventoryItem(rawItem, labels) {
+  let values = rawItem;
+  if (typeof rawItem === "string") {
+    const text = rawItem.trim();
+    if (!text) throw new Error("invalid_inventory_item");
+    if (text.startsWith("{")) {
+      try { values = JSON.parse(text); } catch { throw new Error("invalid_inventory_item"); }
+    } else {
+      const parts = text.split("|").map((part) => part.trim());
+      if (parts.length !== labels.length) throw new Error("invalid_inventory_item");
+      values = Object.fromEntries(labels.map((label, index) => [label, parts[index]]));
+    }
+  }
+  if (!values || typeof values !== "object" || Array.isArray(values)) throw new Error("invalid_inventory_item");
+  const item = {};
+  for (const [key, rawValue] of Object.entries(values)) {
+    const label = String(key || "").trim();
+    const value = String(rawValue ?? "").trim();
+    if (!label || label.length > 40 || !value || value.length > 2_000) throw new Error("invalid_inventory_item");
+    item[label] = value;
+  }
+  if (!Object.keys(item).length || Object.keys(item).length > 10 || JSON.stringify(item).length > 8_000) throw new Error("invalid_inventory_item");
+  return item;
 }
 
 async function qvRequest(env, method, path, body = null, configOverride = null) {
@@ -2580,6 +3226,50 @@ async function decryptSellerApiKey(value, secret) {
   return new TextDecoder().decode(decrypted);
 }
 
+function inventoryEncryptionSecret(env) {
+  const secret = String(env.INVENTORY_ENCRYPTION_KEY || env.SELLER_CONFIG_ENCRYPTION_KEY || env.MANAGER_API_SECRET || "");
+  if (secret.length < 16) throw new Error("local_encryption_not_configured");
+  return secret;
+}
+
+async function inventoryEncryptionKey(secret) {
+  const material = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`local-inventory-v1:${secret}`));
+  return crypto.subtle.importKey("raw", material, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+async function encryptInventoryPayload(payload, secret) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await inventoryEncryptionKey(secret);
+  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+  return `v1.${base64UrlBytes(iv)}.${base64UrlBytes(new Uint8Array(encrypted))}`;
+}
+
+async function decryptInventoryPayload(value, secret) {
+  const [version, encodedIv, encodedCiphertext] = String(value || "").split(".");
+  if (version !== "v1" || !encodedIv || !encodedCiphertext) throw new Error("local_invalid_encrypted_payload");
+  const key = await inventoryEncryptionKey(secret);
+  const decrypted = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: base64UrlDecode(encodedIv) },
+    key,
+    base64UrlDecode(encodedCiphertext),
+  );
+  return JSON.parse(new TextDecoder().decode(decrypted));
+}
+
+async function inventoryPayloadFingerprint(payload, secret) {
+  const canonical = JSON.stringify(Object.fromEntries(Object.entries(payload).sort(([left], [right]) => left.localeCompare(right))));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`local-inventory-fingerprint-v1:${canonical}`));
+  return base64UrlBytes(new Uint8Array(signature));
+}
+
 function base64UrlDecode(value) {
   const normalized = String(value).replace(/-/g, "+").replace(/_/g, "/");
   const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
@@ -2587,32 +3277,267 @@ function base64UrlDecode(value) {
   return Uint8Array.from(binary, (char) => char.charCodeAt(0));
 }
 
-async function firestoreFetch(env, url, init = {}) {
-  const token = await getFirebaseAccessToken(env);
+async function firebaseConfigEncryptionKey(secret) {
+  if (!secret) throw new Error("firebase_encryption_not_configured");
+  const material = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(`firebase-project-config-v1:${secret}`),
+  );
+  return crypto.subtle.importKey("raw", material, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+async function encryptFirebaseCredentials(credentials, secret) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await firebaseConfigEncryptionKey(secret);
+  const plaintext = new TextEncoder().encode(JSON.stringify(credentials));
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+  return `v1.${base64UrlBytes(iv)}.${base64UrlBytes(new Uint8Array(ciphertext))}`;
+}
+
+async function decryptFirebaseCredentials(value, secret) {
+  const [version, encodedIv, encodedCiphertext] = String(value || "").split(".");
+  if (version !== "v1" || !encodedIv || !encodedCiphertext) throw new Error("firebase_invalid_encrypted_config");
+  try {
+    const key = await firebaseConfigEncryptionKey(secret);
+    const plaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: base64UrlDecode(encodedIv) },
+      key,
+      base64UrlDecode(encodedCiphertext),
+    );
+    return JSON.parse(new TextDecoder().decode(plaintext));
+  } catch (error) {
+    if (String(error?.message || "").startsWith("firebase_")) throw error;
+    throw new Error("firebase_invalid_encrypted_config");
+  }
+}
+
+function firebaseEnvironmentConfig(env) {
+  return {
+    FIREBASE_PROJECT_ID: String(env.FIREBASE_PROJECT_ID || "").trim(),
+    FIREBASE_DATABASE_ID: String(env.FIREBASE_DATABASE_ID || "(default)").trim() || "(default)",
+    FIREBASE_CLIENT_EMAIL: String(env.FIREBASE_CLIENT_EMAIL || "").trim(),
+    FIREBASE_PRIVATE_KEY: String(env.FIREBASE_PRIVATE_KEY || ""),
+    FIREBASE_PAYMENTS_COLLECTION: String(env.FIREBASE_PAYMENTS_COLLECTION || "transactions,notifications"),
+    FIREBASE_CLAIMS_COLLECTION: String(env.FIREBASE_CLAIMS_COLLECTION || "transaction_claims").trim(),
+    FIREBASE_REFERRALS_COLLECTION: String(env.FIREBASE_REFERRALS_COLLECTION || "referrals").trim(),
+    FIREBASE_MANAGER_COLLECTIONS: String(env.FIREBASE_MANAGER_COLLECTIONS || ""),
+    connectionId: null,
+    source: "environment",
+    activatedAt: null,
+  };
+}
+
+function firebaseConfigFromRow(row, credentials) {
+  return {
+    FIREBASE_PROJECT_ID: String(row.project_id || ""),
+    FIREBASE_DATABASE_ID: String(row.database_id || "(default)"),
+    FIREBASE_CLIENT_EMAIL: String(credentials?.clientEmail || row.client_email || ""),
+    FIREBASE_PRIVATE_KEY: String(credentials?.privateKey || ""),
+    FIREBASE_PAYMENTS_COLLECTION: String(row.payments_collections || "transactions,notifications"),
+    FIREBASE_CLAIMS_COLLECTION: String(row.claims_collection || "transaction_claims"),
+    FIREBASE_REFERRALS_COLLECTION: String(row.referrals_collection || "referrals"),
+    FIREBASE_MANAGER_COLLECTIONS: String(row.manager_collections || ""),
+    connectionId: Number(row.id),
+    source: "website",
+    activatedAt: String(row.activated_at || row.created_at || ""),
+  };
+}
+
+async function loadFirebaseRuntimeConfig(env) {
+  const row = await env.DB.prepare(`SELECT * FROM firebase_project_connections WHERE status = 'active' ORDER BY id DESC LIMIT 1`).first();
+  if (!row) return firebaseEnvironmentConfig(env);
+  const credentials = await decryptFirebaseCredentials(row.encrypted_credentials, env.FIREBASE_CONFIG_ENCRYPTION_KEY);
+  return firebaseConfigFromRow(row, credentials);
+}
+
+function publicFirebaseConnectionRow(row) {
+  return {
+    id: Number(row.id),
+    projectId: String(row.project_id || ""),
+    databaseId: String(row.database_id || "(default)"),
+    clientEmail: String(row.client_email || ""),
+    status: String(row.status || "archived"),
+    activatedAt: String(row.activated_at || row.created_at || ""),
+  };
+}
+
+async function publicFirebaseConnectionStatus(env) {
+  const firebase = await loadFirebaseRuntimeConfig(env);
+  const history = await env.DB.prepare(`SELECT id, project_id, database_id, client_email, status, created_at, activated_at
+    FROM firebase_project_connections ORDER BY activated_at DESC, id DESC LIMIT ?`)
+    .bind(FIREBASE_CONNECTION_HISTORY_LIMIT).all();
+  return {
+    projectId: firebase.FIREBASE_PROJECT_ID,
+    databaseId: firebase.FIREBASE_DATABASE_ID,
+    clientEmail: firebase.FIREBASE_CLIENT_EMAIL,
+    source: firebase.source,
+    activatedAt: firebase.activatedAt,
+    paymentsCollections: csv(firebase.FIREBASE_PAYMENTS_COLLECTION),
+    claimsCollection: firebase.FIREBASE_CLAIMS_COLLECTION,
+    referralsCollection: firebase.FIREBASE_REFERRALS_COLLECTION,
+    managerCollections: csv(firebase.FIREBASE_MANAGER_COLLECTIONS),
+    collections: firestoreManagerCollections(firebase),
+    connections: (history.results || []).map(publicFirebaseConnectionRow),
+  };
+}
+
+function validateFirebaseProjectInput(payload) {
+  let serviceAccount = payload?.serviceAccount;
+  if (typeof serviceAccount === "string") {
+    if (!serviceAccount.trim() || serviceAccount.length > 50_000) throw new Error("firebase_invalid_service_account");
+    try { serviceAccount = JSON.parse(serviceAccount); } catch { throw new Error("firebase_invalid_service_account"); }
+  }
+  if (!serviceAccount || typeof serviceAccount !== "object" || Array.isArray(serviceAccount)) throw new Error("firebase_invalid_service_account");
+
+  const projectId = String(serviceAccount.project_id || "").trim();
+  const clientEmail = String(serviceAccount.client_email || "").trim();
+  const privateKey = String(serviceAccount.private_key || "");
+  const databaseId = String(payload?.databaseId || "(default)").trim() || "(default)";
+  const paymentsCollections = Array.isArray(payload?.paymentsCollections)
+    ? payload.paymentsCollections.map(String)
+    : csv(payload?.paymentsCollections || "transactions,notifications");
+  const claimsCollection = String(payload?.claimsCollection || "transaction_claims").trim();
+  const referralsCollection = String(payload?.referralsCollection || "referrals").trim();
+  const managerCollections = Array.isArray(payload?.managerCollections)
+    ? payload.managerCollections.map(String)
+    : csv(payload?.managerCollections || "");
+
+  if (serviceAccount.type !== "service_account" || !/^[a-z][a-z0-9-]{4,61}[a-z0-9]$/.test(projectId)) throw new Error("firebase_invalid_service_account");
+  if (!/^[^\s@]+@[^\s@]+\.iam\.gserviceaccount\.com$/.test(clientEmail)) throw new Error("firebase_invalid_service_account");
+  if (!privateKey.includes("-----BEGIN PRIVATE KEY-----") || !privateKey.includes("-----END PRIVATE KEY-----") || privateKey.length > 10_000) {
+    throw new Error("firebase_invalid_service_account");
+  }
+  if (databaseId !== "(default)" && !/^[a-z][a-z0-9-]{2,62}$/.test(databaseId)) throw new Error("firebase_invalid_database");
+  const allCollections = [...paymentsCollections, claimsCollection, referralsCollection, ...managerCollections];
+  if (!paymentsCollections.length || allCollections.some((value) => !validFirestorePathSegment(value))) throw new Error("firebase_invalid_collections");
+
+  return {
+    FIREBASE_PROJECT_ID: projectId,
+    FIREBASE_DATABASE_ID: databaseId,
+    FIREBASE_CLIENT_EMAIL: clientEmail,
+    FIREBASE_PRIVATE_KEY: privateKey,
+    FIREBASE_PAYMENTS_COLLECTION: [...new Set(paymentsCollections.map((value) => String(value).trim()))].join(","),
+    FIREBASE_CLAIMS_COLLECTION: claimsCollection,
+    FIREBASE_REFERRALS_COLLECTION: referralsCollection,
+    FIREBASE_MANAGER_COLLECTIONS: [...new Set(managerCollections.map((value) => String(value).trim()).filter(Boolean))].join(","),
+    connectionId: null,
+    source: "candidate",
+    activatedAt: null,
+  };
+}
+
+function firebaseConnectionInsert(env, firebase, encryptedCredentials, status) {
+  return env.DB.prepare(`INSERT INTO firebase_project_connections
+    (project_id, database_id, client_email, encrypted_credentials, payments_collections,
+      claims_collection, referrals_collection, manager_collections, status, activated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`)
+    .bind(
+      firebase.FIREBASE_PROJECT_ID,
+      firebase.FIREBASE_DATABASE_ID,
+      firebase.FIREBASE_CLIENT_EMAIL,
+      encryptedCredentials,
+      firebase.FIREBASE_PAYMENTS_COLLECTION,
+      firebase.FIREBASE_CLAIMS_COLLECTION,
+      firebase.FIREBASE_REFERRALS_COLLECTION,
+      firebase.FIREBASE_MANAGER_COLLECTIONS,
+      status,
+    );
+}
+
+async function verifyFirebaseConnection(env, firebase) {
+  const collection = csv(firebase.FIREBASE_PAYMENTS_COLLECTION)[0];
+  const url = `${firestoreDocumentsRoot(firebase)}/${encodeURIComponent(collection)}?pageSize=1`;
+  try {
+    const response = await firestoreFetch(env, url, {}, firebase);
+    if (!response.ok) {
+      console.error(JSON.stringify({ event: "firebase_connection_test_failed", projectId: firebase.FIREBASE_PROJECT_ID, status: response.status }));
+      throw new Error("firebase_connection_failed");
+    }
+  } catch (error) {
+    if (String(error?.message || "").startsWith("firebase_")) throw error;
+    throw new Error("firebase_connection_failed");
+  }
+}
+
+async function activateFirebaseProject(env, payload) {
+  const candidate = validateFirebaseProjectInput(payload);
+  if (String(payload?.confirmProjectId || "").trim() !== candidate.FIREBASE_PROJECT_ID) throw new Error("firebase_project_confirmation_failed");
+  await verifyFirebaseConnection(env, candidate);
+  const encryptedCandidate = await encryptFirebaseCredentials({
+    clientEmail: candidate.FIREBASE_CLIENT_EMAIL,
+    privateKey: candidate.FIREBASE_PRIVATE_KEY,
+  }, env.FIREBASE_CONFIG_ENCRYPTION_KEY);
+
+  const currentRow = await env.DB.prepare(`SELECT id FROM firebase_project_connections WHERE status = 'active' LIMIT 1`).first();
+  const statements = [
+    env.DB.prepare(`UPDATE firebase_project_connections SET status = 'archived' WHERE status = 'previous'`),
+    env.DB.prepare(`UPDATE firebase_project_connections SET status = 'previous' WHERE status = 'active'`),
+  ];
+  if (!currentRow) {
+    const fallback = firebaseEnvironmentConfig(env);
+    if (fallback.FIREBASE_PROJECT_ID && fallback.FIREBASE_CLIENT_EMAIL && fallback.FIREBASE_PRIVATE_KEY) {
+      const encryptedFallback = await encryptFirebaseCredentials({
+        clientEmail: fallback.FIREBASE_CLIENT_EMAIL,
+        privateKey: fallback.FIREBASE_PRIVATE_KEY,
+      }, env.FIREBASE_CONFIG_ENCRYPTION_KEY);
+      statements.push(firebaseConnectionInsert(env, fallback, encryptedFallback, "previous"));
+    }
+  }
+  statements.push(firebaseConnectionInsert(env, candidate, encryptedCandidate, "active"));
+  statements.push(env.DB.prepare("DELETE FROM payment_lookup_cache"));
+  await env.DB.batch(statements);
+  await env.DB.prepare(`DELETE FROM firebase_project_connections WHERE status = 'archived' AND id NOT IN
+    (SELECT id FROM firebase_project_connections WHERE status = 'archived' ORDER BY activated_at DESC, id DESC LIMIT ?)`)
+    .bind(FIREBASE_CONNECTION_HISTORY_LIMIT - 2).run();
+  return publicFirebaseConnectionStatus(env);
+}
+
+async function rollbackFirebaseProject(env, connectionId) {
+  const id = Number(connectionId);
+  if (!Number.isSafeInteger(id) || id < 1) throw new Error("firebase_invalid_connection");
+  const row = await env.DB.prepare(`SELECT * FROM firebase_project_connections WHERE id = ? AND status <> 'active'`).bind(id).first();
+  if (!row) throw new Error("firebase_connection_not_found");
+  const credentials = await decryptFirebaseCredentials(row.encrypted_credentials, env.FIREBASE_CONFIG_ENCRYPTION_KEY);
+  const target = firebaseConfigFromRow(row, credentials);
+  await verifyFirebaseConnection(env, target);
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE firebase_project_connections SET status = 'archived' WHERE status <> 'active' AND id <> ?`).bind(id),
+    env.DB.prepare(`UPDATE firebase_project_connections SET status = 'previous' WHERE status = 'active'`),
+    env.DB.prepare(`UPDATE firebase_project_connections SET status = 'active', activated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(id),
+    env.DB.prepare("DELETE FROM payment_lookup_cache"),
+  ]);
+  return publicFirebaseConnectionStatus(env);
+}
+
+async function firestoreFetch(env, url, init = {}, firebase = null) {
+  const runtime = firebase || await loadFirebaseRuntimeConfig(env);
+  const token = await getFirebaseAccessToken(env, runtime);
   const headers = new Headers(init.headers || {});
   headers.set("authorization", `Bearer ${token}`);
   return fetch(url, { ...init, headers });
 }
 
-async function getFirebaseAccessToken(env) {
+async function getFirebaseAccessToken(env, firebase = null) {
+  const runtime = firebase || await loadFirebaseRuntimeConfig(env);
   const now = Math.floor(Date.now() / 1000);
-  if (firebaseTokenCache && firebaseTokenCache.expiresAt - FIREBASE_TOKEN_EARLY_REFRESH_SECONDS > now) {
+  const cacheKey = `${runtime.FIREBASE_PROJECT_ID}:${runtime.FIREBASE_CLIENT_EMAIL}`;
+  if (firebaseTokenCache?.cacheKey === cacheKey && firebaseTokenCache.expiresAt - FIREBASE_TOKEN_EARLY_REFRESH_SECONDS > now) {
     return firebaseTokenCache.token;
   }
-  if (!env.FIREBASE_CLIENT_EMAIL || !env.FIREBASE_PRIVATE_KEY) {
-    throw new Error("Firebase service account is not configured");
-  }
+  if (!runtime.FIREBASE_CLIENT_EMAIL || !runtime.FIREBASE_PRIVATE_KEY) throw new Error("firebase_not_configured");
 
   const header = base64UrlJson({ alg: "RS256", typ: "JWT" });
   const claims = base64UrlJson({
-    iss: env.FIREBASE_CLIENT_EMAIL,
+    iss: runtime.FIREBASE_CLIENT_EMAIL,
     scope: "https://www.googleapis.com/auth/datastore",
     aud: "https://oauth2.googleapis.com/token",
     iat: now,
     exp: now + 3600,
   });
   const signingInput = `${header}.${claims}`;
-  const privateKey = await importFirebasePrivateKey(env.FIREBASE_PRIVATE_KEY);
+  let privateKey;
+  try { privateKey = await importFirebasePrivateKey(runtime.FIREBASE_PRIVATE_KEY); }
+  catch { throw new Error("firebase_invalid_service_account"); }
   const signature = await crypto.subtle.sign(
     { name: "RSASSA-PKCS1-v1_5" },
     privateKey,
@@ -2629,9 +3554,10 @@ async function getFirebaseAccessToken(env) {
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || !payload.access_token) {
-    throw new Error(`Firebase OAuth failed (${response.status})`);
+    throw new Error("firebase_credentials_rejected");
   }
   firebaseTokenCache = {
+    cacheKey,
     token: payload.access_token,
     expiresAt: now + Number(payload.expires_in || 3600),
   };
@@ -2667,21 +3593,193 @@ function base64UrlBytes(bytes) {
 }
 
 async function firestoreHealthCheck(env) {
-  const collection = csv(env.FIREBASE_PAYMENTS_COLLECTION)[0] || "transactions";
-  const url = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/${encodeURIComponent(collection)}?pageSize=1`;
-  const response = await firestoreFetch(env, url);
+  const firebase = await loadFirebaseRuntimeConfig(env);
+  const collection = csv(firebase.FIREBASE_PAYMENTS_COLLECTION)[0] || "transactions";
+  const url = `${firestoreDocumentsRoot(firebase)}/${encodeURIComponent(collection)}?pageSize=1`;
+  const response = await firestoreFetch(env, url, {}, firebase);
   if (!response.ok) throw new Error(`Firebase health check failed (${response.status})`);
 }
 
+function firestoreManagerCollections(env) {
+  const collections = [
+    ...csv(env.FIREBASE_PAYMENTS_COLLECTION),
+    String(env.FIREBASE_CLAIMS_COLLECTION || "transaction_claims").trim(),
+    String(env.FIREBASE_REFERRALS_COLLECTION || "referrals").trim(),
+    ...csv(env.FIREBASE_MANAGER_COLLECTIONS),
+  ].filter(validFirestorePathSegment);
+  return [...new Set(collections)];
+}
+
+function validFirestorePathSegment(value) {
+  const segment = String(value || "").trim();
+  return Boolean(segment)
+    && segment !== "."
+    && segment !== ".."
+    && !segment.includes("/")
+    && !/[\u0000-\u001f\u007f]/.test(segment)
+    && new TextEncoder().encode(segment).byteLength <= 500;
+}
+
+function requireFirestoreManagerCollection(env, value) {
+  const collection = String(value || "").trim();
+  if (!firestoreManagerCollections(env).includes(collection)) throw new Error("firestore_invalid_collection");
+  return collection;
+}
+
+function requireFirestoreDocumentId(value) {
+  const documentId = String(value || "").trim();
+  if (!validFirestorePathSegment(documentId)) throw new Error("firestore_invalid_document_id");
+  return documentId;
+}
+
+function firestoreDocumentsRoot(firebase) {
+  if (!firebase.FIREBASE_PROJECT_ID) throw new Error("firestore_not_configured");
+  return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebase.FIREBASE_PROJECT_ID)}/databases/${encodeURIComponent(firebase.FIREBASE_DATABASE_ID || "(default)")}/documents`;
+}
+
+function firestoreDocumentUrl(firebase, collection, documentId = "") {
+  const root = firestoreDocumentsRoot(firebase);
+  return `${root}/${encodeURIComponent(collection)}${documentId ? `/${encodeURIComponent(documentId)}` : ""}`;
+}
+
+function managedFirestoreDocument(document) {
+  const fields = {};
+  for (const [key, value] of Object.entries(document?.fields || {})) fields[key] = firestoreValue(value, true);
+  return {
+    id: String(document?.name || "").split("/").pop() || "",
+    fields,
+    createTime: String(document?.createTime || ""),
+    updateTime: String(document?.updateTime || ""),
+  };
+}
+
+async function firestoreManagerFailure(response, fallback) {
+  const details = await response.json().catch(() => ({}));
+  console.error(JSON.stringify({
+    event: "firestore_manager_request_failed",
+    status: response.status,
+    code: details?.error?.status || null,
+  }));
+  if (response.status === 404) return new Error("firestore_document_not_found");
+  if (response.status === 409 || response.status === 412) return new Error("firestore_document_changed");
+  return new Error(fallback);
+}
+
+async function listManagedFirestoreDocuments(env, firebase, collection) {
+  const url = new URL(firestoreDocumentUrl(firebase, collection));
+  url.searchParams.set("pageSize", String(FIRESTORE_MANAGER_LIST_LIMIT));
+  const response = await firestoreFetch(env, url.toString(), {}, firebase);
+  if (!response.ok) throw await firestoreManagerFailure(response, "firestore_request_failed");
+  const payload = await response.json();
+  return (payload.documents || []).map(managedFirestoreDocument);
+}
+
+async function getManagedFirestoreDocument(env, firebase, collection, documentId) {
+  const response = await firestoreFetch(env, firestoreDocumentUrl(firebase, collection, documentId), {}, firebase);
+  if (response.status === 404) return null;
+  if (!response.ok) throw await firestoreManagerFailure(response, "firestore_request_failed");
+  return managedFirestoreDocument(await response.json());
+}
+
+function firestoreFieldsForWrite(fields, depth = 0) {
+  if (depth > FIRESTORE_MANAGER_MAX_DEPTH) throw new Error("firestore_invalid_fields");
+  if (!fields || typeof fields !== "object" || Array.isArray(fields)) throw new Error("firestore_invalid_fields");
+  const encoded = {};
+  for (const [key, value] of Object.entries(fields)) {
+    const fieldName = String(key);
+    const size = new TextEncoder().encode(fieldName).byteLength;
+    if (!fieldName || size > 1_500 || /^__.*__$/.test(fieldName)) throw new Error("firestore_invalid_field_name");
+    encoded[fieldName] = firestoreValueForWrite(value, depth);
+  }
+  return encoded;
+}
+
+function firestoreValueForWrite(value, depth) {
+  if (depth > FIRESTORE_MANAGER_MAX_DEPTH) throw new Error("firestore_invalid_fields");
+  if (value === null) return { nullValue: null };
+  if (typeof value === "string") return { stringValue: value };
+  if (typeof value === "boolean") return { booleanValue: value };
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("firestore_invalid_fields");
+    return Number.isSafeInteger(value) ? { integerValue: String(value) } : { doubleValue: value };
+  }
+  if (Array.isArray(value)) {
+    return { arrayValue: { values: value.map((item) => firestoreValueForWrite(item, depth + 1)) } };
+  }
+  if (!value || typeof value !== "object") throw new Error("firestore_invalid_fields");
+
+  const keys = Object.keys(value);
+  if (keys.length === 1 && keys[0] === "$timestamp") {
+    const timestamp = String(value.$timestamp || "");
+    if (!timestamp || !Number.isFinite(Date.parse(timestamp))) throw new Error("firestore_invalid_timestamp");
+    return { timestampValue: timestamp };
+  }
+  if (keys.length === 1 && keys[0] === "$integer") {
+    const integer = String(value.$integer || "");
+    if (!/^-?\d+$/.test(integer)) throw new Error("firestore_invalid_integer");
+    return { integerValue: integer };
+  }
+  if (keys.length === 1 && keys[0] === "$double") {
+    const double = String(value.$double || "");
+    if (!["NaN", "Infinity", "-Infinity"].includes(double)) throw new Error("firestore_invalid_double");
+    return { doubleValue: double };
+  }
+  if (keys.length === 1 && keys[0] === "$bytes") {
+    const bytes = String(value.$bytes || "");
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(bytes)) throw new Error("firestore_invalid_bytes");
+    return { bytesValue: bytes };
+  }
+  if (keys.length === 1 && keys[0] === "$reference") {
+    const reference = String(value.$reference || "");
+    if (!reference.startsWith("projects/") || !reference.includes("/documents/")) throw new Error("firestore_invalid_reference");
+    return { referenceValue: reference };
+  }
+  if (keys.length === 1 && keys[0] === "$geoPoint") {
+    const latitude = Number(value.$geoPoint?.latitude);
+    const longitude = Number(value.$geoPoint?.longitude);
+    if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+      throw new Error("firestore_invalid_geo_point");
+    }
+    return { geoPointValue: { latitude, longitude } };
+  }
+
+  return { mapValue: { fields: firestoreFieldsForWrite(value, depth + 1) } };
+}
+
+async function saveManagedFirestoreDocument(env, firebase, { collection, documentId, fields, create, updateTime }) {
+  const url = new URL(firestoreDocumentUrl(firebase, collection, documentId));
+  if (create) url.searchParams.set("currentDocument.exists", "false");
+  else {
+    if (!updateTime || !Number.isFinite(Date.parse(updateTime))) throw new Error("firestore_invalid_update_time");
+    url.searchParams.set("currentDocument.updateTime", updateTime);
+  }
+  const response = await firestoreFetch(env, url.toString(), {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ fields: firestoreFieldsForWrite(fields) }),
+  }, firebase);
+  if (!response.ok) throw await firestoreManagerFailure(response, "firestore_request_failed");
+  return managedFirestoreDocument(await response.json());
+}
+
+async function deleteManagedFirestoreDocument(env, firebase, collection, documentId, updateTime) {
+  if (!updateTime || !Number.isFinite(Date.parse(updateTime))) throw new Error("firestore_invalid_update_time");
+  const url = new URL(firestoreDocumentUrl(firebase, collection, documentId));
+  url.searchParams.set("currentDocument.updateTime", updateTime);
+  const response = await firestoreFetch(env, url.toString(), { method: "DELETE" }, firebase);
+  if (!response.ok) throw await firestoreManagerFailure(response, "firestore_request_failed");
+}
+
 async function findFirestorePayment(env, transactionId) {
+  const firebase = await loadFirebaseRuntimeConfig(env);
   const cached = await getCachedPaymentLookup(env, transactionId);
   if (cached?.status === "found") return cached.payment;
   if (cached?.status === "not_found") return null;
   if (cached?.status === "invalid_provider") throw new Error("invalid_payment_provider");
 
-  for (const collection of csv(env.FIREBASE_PAYMENTS_COLLECTION)) {
+  for (const collection of csv(firebase.FIREBASE_PAYMENTS_COLLECTION)) {
     for (const field of TRANSACTION_FIELDS) {
-      const payment = await queryFirestorePayment(env, collection, field, transactionId);
+      const payment = await queryFirestorePayment(env, firebase, collection, field, transactionId);
       if (payment) {
         await cachePaymentLookup(env, transactionId, "found", payment, PAYMENT_FOUND_CACHE_TTL_SECONDS);
         return payment;
@@ -2692,8 +3790,8 @@ async function findFirestorePayment(env, transactionId) {
   return null;
 }
 
-async function queryFirestorePayment(env, collection, field, transactionId) {
-  const url = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery`;
+async function queryFirestorePayment(env, firebase, collection, field, transactionId) {
+  const url = `${firestoreDocumentsRoot(firebase)}:runQuery`;
   const body = {
     structuredQuery: {
       from: [{ collectionId: collection }],
@@ -2701,7 +3799,7 @@ async function queryFirestorePayment(env, collection, field, transactionId) {
       limit: 1,
     },
   };
-  const response = await firestoreFetch(env, url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const response = await firestoreFetch(env, url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, firebase);
   if (!response.ok) throw new Error(`Firebase lookup failed: ${await response.text()}`);
   const rows = await response.json();
   for (const row of rows) {
@@ -2800,15 +3898,17 @@ function parsePaymentDocument(document, fallbackTransactionId) {
 }
 
 async function firestoreClaimExists(env, transactionId) {
-  const url = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/${env.FIREBASE_CLAIMS_COLLECTION}/${encodeURIComponent(transactionId)}`;
-  const response = await firestoreFetch(env, url);
+  const firebase = await loadFirebaseRuntimeConfig(env);
+  const url = `${firestoreDocumentsRoot(firebase)}/${encodeURIComponent(firebase.FIREBASE_CLAIMS_COLLECTION)}/${encodeURIComponent(transactionId)}`;
+  const response = await firestoreFetch(env, url, {}, firebase);
   if (response.status === 404) return false;
   if (!response.ok) throw new Error(`Firebase claim lookup failed: ${await response.text()}`);
   return true;
 }
 
 async function createFirestoreClaim(env, payment, telegramId, amountBdt) {
-  const url = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/${env.FIREBASE_CLAIMS_COLLECTION}?documentId=${encodeURIComponent(payment.transaction_id)}`;
+  const firebase = await loadFirebaseRuntimeConfig(env);
+  const url = `${firestoreDocumentsRoot(firebase)}/${encodeURIComponent(firebase.FIREBASE_CLAIMS_COLLECTION)}?documentId=${encodeURIComponent(payment.transaction_id)}`;
   const body = {
     fields: {
       transactionId: { stringValue: payment.transaction_id },
@@ -2820,7 +3920,7 @@ async function createFirestoreClaim(env, payment, telegramId, amountBdt) {
       claimedAt: { timestampValue: new Date().toISOString() },
     },
   };
-  const response = await firestoreFetch(env, url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const response = await firestoreFetch(env, url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, firebase);
   if (response.status === 409) throw new Error("This transaction ID was already used.");
   if (!response.ok) throw new Error(`Firebase claim write failed: ${await response.text()}`);
 }
@@ -3050,9 +4150,10 @@ async function completePendingReferral(env, referredId) {
 }
 
 async function createFirestoreReferral(env, referredId, referrerId) {
-  const collection = env.FIREBASE_REFERRALS_COLLECTION || "referrals";
+  const firebase = await loadFirebaseRuntimeConfig(env);
+  const collection = firebase.FIREBASE_REFERRALS_COLLECTION || "referrals";
   const documentId = String(referredId);
-  const url = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/${collection}?documentId=${encodeURIComponent(documentId)}`;
+  const url = `${firestoreDocumentsRoot(firebase)}/${encodeURIComponent(collection)}?documentId=${encodeURIComponent(documentId)}`;
   const body = {
     fields: {
       referredId: { integerValue: String(referredId) },
@@ -3061,7 +4162,7 @@ async function createFirestoreReferral(env, referredId, referrerId) {
       completedAt: { timestampValue: new Date().toISOString() },
     },
   };
-  const response = await firestoreFetch(env, url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const response = await firestoreFetch(env, url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, firebase);
   if (response.status === 409) return;
   if (!response.ok) throw new Error(await response.text());
 }
@@ -3220,6 +4321,20 @@ async function getBalance(env, userId) {
   return Number(row?.balance_bdt || 0);
 }
 
+async function acquirePurchaseLock(env, userId) {
+  const token = crypto.randomUUID();
+  await env.DB.prepare(`INSERT INTO purchase_locks (telegram_id, token, expires_at)
+    VALUES (?, ?, datetime('now', '+2 minutes'))
+    ON CONFLICT(telegram_id) DO UPDATE SET token = excluded.token, expires_at = excluded.expires_at
+    WHERE purchase_locks.expires_at <= CURRENT_TIMESTAMP`).bind(userId, token).run();
+  const row = await env.DB.prepare("SELECT token FROM purchase_locks WHERE telegram_id = ?").bind(userId).first();
+  return row?.token === token ? token : null;
+}
+
+async function releasePurchaseLock(env, userId, token) {
+  await env.DB.prepare("DELETE FROM purchase_locks WHERE telegram_id = ? AND token = ?").bind(userId, token).run();
+}
+
 async function addBalance(env, userId, amount) {
   await ensureUser(env, userId);
   await env.DB.prepare("UPDATE users SET balance_bdt = balance_bdt + ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ?").bind(Math.round(Number(amount)), userId).run();
@@ -3240,31 +4355,111 @@ async function deductBalance(env, userId, amount) {
   return getBalance(env, userId);
 }
 
-async function recordCompletedPurchase(env, userId, productKey, variantKey, quantity, chargedBdt, providerOrderId) {
+async function recordCompletedPurchase(env, userId, productKey, variantKey, quantity, chargedBdt, providerOrderId,
+  fulfillmentSource, encryptedDelivery) {
   const amount = Math.round(Number(chargedBdt));
   const purchaseKey = crypto.randomUUID();
-  const debit = await env.DB.prepare(`UPDATE users SET balance_bdt = balance_bdt - ?, updated_at = CURRENT_TIMESTAMP
-    WHERE telegram_id = ? AND balance_bdt >= ?`).bind(amount, userId, amount).run();
-  if (Number(debit.meta?.changes || 0) !== 1) throw new Error("Insufficient local balance");
-
+  const fulfillmentId = crypto.randomUUID();
   try {
     await env.DB.batch([
+      env.DB.prepare(`INSERT INTO purchase_guards (id, valid)
+        SELECT ?, CASE WHEN EXISTS (SELECT 1 FROM users WHERE telegram_id = ? AND balance_bdt >= ?) THEN 1 ELSE 0 END`)
+        .bind(purchaseKey, userId, amount),
+      env.DB.prepare(`UPDATE users SET balance_bdt = balance_bdt - ?, updated_at = CURRENT_TIMESTAMP
+        WHERE telegram_id = ? AND balance_bdt >= ?`).bind(amount, userId, amount),
       env.DB.prepare(`INSERT INTO local_orders
-        (telegram_id, product_key, variant_key, quantity, charged_bdt, provider_order_id, purchase_key)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`)
-        .bind(userId, productKey, variantKey, quantity, amount, providerOrderId, purchaseKey),
+        (telegram_id, product_key, variant_key, quantity, charged_bdt, provider_order_id, fulfillment_source, purchase_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+        .bind(userId, productKey, variantKey, quantity, amount, providerOrderId, fulfillmentSource, purchaseKey),
       env.DB.prepare(`INSERT OR IGNORE INTO referral_rewards (local_order_id, referred_id, referrer_id, reward_bdt)
         SELECT orders.id, referrals.referred_id, referrals.referrer_id, ?
         FROM local_orders AS orders
         JOIN referrals ON referrals.referred_id = orders.telegram_id
         WHERE orders.purchase_key = ? AND referrals.status = 'completed' AND orders.created_at >= referrals.created_at`)
         .bind(REFERRAL_REWARD_BDT, purchaseKey),
+      env.DB.prepare(`INSERT INTO order_fulfillments
+        (id, local_order_id, telegram_id, encrypted_payload, charged_bdt)
+        SELECT ?, id, telegram_id, ?, charged_bdt FROM local_orders WHERE purchase_key = ?`)
+        .bind(fulfillmentId, encryptedDelivery, purchaseKey),
+      env.DB.prepare("DELETE FROM purchase_guards WHERE id = ?").bind(purchaseKey),
     ]);
   } catch (error) {
-    await env.DB.prepare("UPDATE users SET balance_bdt = balance_bdt + ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ?")
-      .bind(amount, userId).run();
+    if (await getBalance(env, userId) < amount) throw new Error("Insufficient local balance");
     throw error;
   }
+
+  await notifyReferralReward(env, purchaseKey, userId);
+  return purchaseKey;
+}
+
+async function purchaseLocalProduct(env, chatId, userId, product, quantity, chargedBdt) {
+  if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 500) throw new Error("Invalid quantity.");
+  const stock = await env.DB.prepare(`SELECT id, encrypted_payload FROM local_inventory_items
+    WHERE product_key = ? AND status = 'available' ORDER BY created_at, id LIMIT ?`)
+    .bind(product.productKey, quantity).all();
+  const selected = stock.results || [];
+  if (selected.length !== quantity) throw new Error(`Only ${selected.length} item(s) are currently available.`);
+
+  const secret = inventoryEncryptionSecret(env);
+  const deliveredItems = [];
+  for (const row of selected) {
+    const values = await decryptInventoryPayload(row.encrypted_payload, secret);
+    deliveredItems.push({
+      fields: Object.entries(values).map(([label, value]) => ({ name: label, label, value: String(value) })),
+      data: values,
+    });
+  }
+  const purchaseKey = crypto.randomUUID();
+  const providerOrderId = `LOCAL-${purchaseKey.slice(0, 8).toUpperCase()}`;
+  const order = { orderId: providerOrderId, requested: quantity, fulfilled: quantity, items: deliveredItems };
+  const encryptedDelivery = await encryptInventoryPayload(order, secret);
+  const amount = Math.round(Number(chargedBdt));
+  const placeholders = selected.map(() => "?").join(", ");
+  const selectedIds = selected.map((row) => row.id);
+  const fulfillmentId = crypto.randomUUID();
+
+  try {
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO purchase_guards (id, valid)
+        SELECT ?, CASE WHEN
+          EXISTS (SELECT 1 FROM users WHERE telegram_id = ? AND balance_bdt >= ?)
+          AND (SELECT COUNT(*) FROM local_inventory_items WHERE id IN (${placeholders}) AND product_key = ? AND status = 'available') = ?
+          THEN 1 ELSE 0 END`).bind(purchaseKey, userId, amount, ...selectedIds, product.productKey, quantity),
+      env.DB.prepare(`UPDATE users SET balance_bdt = balance_bdt - ?, updated_at = CURRENT_TIMESTAMP
+        WHERE telegram_id = ? AND balance_bdt >= ?`).bind(amount, userId, amount),
+      env.DB.prepare(`INSERT INTO local_orders
+        (telegram_id, product_key, variant_key, quantity, charged_bdt, provider_order_id, fulfillment_source, purchase_key)
+        VALUES (?, ?, NULL, ?, ?, ?, 'local', ?)`)
+        .bind(userId, product.productKey, quantity, amount, providerOrderId, purchaseKey),
+      env.DB.prepare(`UPDATE local_inventory_items SET status = 'delivered',
+        local_order_id = (SELECT id FROM local_orders WHERE purchase_key = ?), delivered_to = ?, delivered_at = CURRENT_TIMESTAMP
+        WHERE id IN (${placeholders}) AND product_key = ? AND status = 'available'`)
+        .bind(purchaseKey, userId, ...selectedIds, product.productKey),
+      env.DB.prepare(`INSERT OR IGNORE INTO referral_rewards (local_order_id, referred_id, referrer_id, reward_bdt)
+        SELECT orders.id, referrals.referred_id, referrals.referrer_id, ?
+        FROM local_orders AS orders JOIN referrals ON referrals.referred_id = orders.telegram_id
+        WHERE orders.purchase_key = ? AND referrals.status = 'completed' AND orders.created_at >= referrals.created_at`)
+        .bind(REFERRAL_REWARD_BDT, purchaseKey),
+      env.DB.prepare(`INSERT INTO order_fulfillments
+        (id, local_order_id, telegram_id, encrypted_payload, charged_bdt)
+        SELECT ?, id, telegram_id, ?, charged_bdt FROM local_orders WHERE purchase_key = ?`)
+        .bind(fulfillmentId, encryptedDelivery, purchaseKey),
+      env.DB.prepare("DELETE FROM purchase_guards WHERE id = ?").bind(purchaseKey),
+    ]);
+  } catch (error) {
+    if (await getBalance(env, userId) < amount) throw new Error("Insufficient local balance");
+    const available = await env.DB.prepare("SELECT COUNT(*) AS n FROM local_inventory_items WHERE product_key = ? AND status = 'available'")
+      .bind(product.productKey).first();
+    if (Number(available?.n || 0) < quantity) throw new Error("This product just sold out. Please refresh and try again.");
+    throw error;
+  }
+
+  await notifyReferralReward(env, purchaseKey, userId);
+  await deliverFulfillment(env, purchaseKey, chatId);
+  return purchaseKey;
+}
+
+async function notifyReferralReward(env, purchaseKey, userId) {
 
   const reward = await env.DB.prepare(`SELECT rewards.referrer_id, rewards.reward_bdt, users.username, users.first_name
     FROM referral_rewards AS rewards LEFT JOIN users ON users.telegram_id = rewards.referred_id
@@ -3288,14 +4483,51 @@ async function recordCompletedPurchase(env, userId, productKey, variantKey, quan
   }
 }
 
+async function deliverFulfillment(env, purchaseKey, fallbackChatId = null) {
+  const row = await env.DB.prepare(`SELECT fulfillments.id, fulfillments.telegram_id, fulfillments.encrypted_payload,
+    fulfillments.charged_bdt, fulfillments.status, fulfillments.attempts
+    FROM order_fulfillments AS fulfillments
+    JOIN local_orders AS orders ON orders.id = fulfillments.local_order_id
+    WHERE orders.purchase_key = ?`).bind(purchaseKey).first();
+  if (!row || row.status === "delivered" || Number(row.attempts || 0) >= FULFILLMENT_MAX_ATTEMPTS) return false;
+  const claim = await env.DB.prepare(`UPDATE order_fulfillments SET status = 'processing',
+    next_attempt_at = datetime('now', '+5 minutes')
+    WHERE id = ? AND status != 'delivered' AND attempts < ? AND next_attempt_at <= CURRENT_TIMESTAMP`)
+    .bind(row.id, FULFILLMENT_MAX_ATTEMPTS).run();
+  if (Number(claim.meta?.changes || 0) !== 1) return false;
+  try {
+    const order = await decryptInventoryPayload(row.encrypted_payload, inventoryEncryptionSecret(env));
+    await sendDelivery(env, row.telegram_id || fallbackChatId, order, row.charged_bdt);
+    await env.DB.prepare(`UPDATE order_fulfillments SET status = 'delivered', attempts = attempts + 1,
+      last_error = NULL, delivered_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(row.id).run();
+    return true;
+  } catch (error) {
+    const delayMinutes = Math.min(60, 2 ** Math.min(6, Number(row.attempts || 0)));
+    await env.DB.prepare(`UPDATE order_fulfillments SET status = 'failed', attempts = attempts + 1,
+      last_error = ?, next_attempt_at = datetime('now', '+' || ? || ' minutes') WHERE id = ?`)
+      .bind(String(error?.message || error).slice(0, 300), delayMinutes, row.id).run();
+    console.warn(JSON.stringify({ event: "fulfillment_delivery_failed", fulfillment_id: row.id, error: error?.message || String(error) }));
+    return false;
+  }
+}
+
+async function processFulfillmentQueue(env) {
+  const pending = await env.DB.prepare(`SELECT orders.purchase_key FROM order_fulfillments AS fulfillments
+    JOIN local_orders AS orders ON orders.id = fulfillments.local_order_id
+    WHERE fulfillments.status IN ('pending', 'failed', 'processing') AND fulfillments.attempts < ?
+      AND fulfillments.next_attempt_at <= CURRENT_TIMESTAMP
+    ORDER BY fulfillments.created_at LIMIT ?`).bind(FULFILLMENT_MAX_ATTEMPTS, FULFILLMENT_BATCH_SIZE).all();
+  for (const row of pending.results || []) await deliverFulfillment(env, row.purchase_key);
+}
+
 async function getState(env, userId) {
   return env.DB.prepare("SELECT * FROM user_state WHERE telegram_id = ?").bind(userId).first();
 }
 
 async function setState(env, userId, fields) {
   await env.DB.prepare(`
-    INSERT INTO user_state (telegram_id, state, payment_provider, payment_amount_bdt, bulk_product_key, verify_color, withdrawal_amount_bdt)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO user_state (telegram_id, state, payment_provider, payment_amount_bdt, bulk_product_key, verify_color, withdrawal_amount_bdt, warranty_order_id, warranty_unit_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(telegram_id) DO UPDATE SET
       state = excluded.state,
       payment_provider = excluded.payment_provider,
@@ -3303,6 +4535,8 @@ async function setState(env, userId, fields) {
       bulk_product_key = excluded.bulk_product_key,
       verify_color = excluded.verify_color,
       withdrawal_amount_bdt = excluded.withdrawal_amount_bdt,
+      warranty_order_id = excluded.warranty_order_id,
+      warranty_unit_id = excluded.warranty_unit_id,
       updated_at = CURRENT_TIMESTAMP
   `).bind(
     userId,
@@ -3312,6 +4546,8 @@ async function setState(env, userId, fields) {
     fields.bulk_product_key || null,
     fields.verify_color || null,
     fields.withdrawal_amount_bdt || null,
+    fields.warranty_order_id || null,
+    fields.warranty_unit_id || null,
   ).run();
 }
 
@@ -3482,7 +4718,7 @@ function isAdmin(env, userId) {
 }
 
 function requiredChannel(env) {
-  const username = String(env.REQUIRED_CHANNEL_USERNAME || "").trim();
+  const username = String(env.REQUIRED_CHANNEL_USERNAME || "@ToolzAIchannel").trim();
   if (!username) return "";
   return username.startsWith("@") ? username : `@${username}`;
 }
@@ -3540,15 +4776,26 @@ function productStock(product) {
   return String(product.stock || 0);
 }
 
-function firestoreValue(value) {
+function firestoreValue(value, preserveSpecialTypes = false) {
+  if ("nullValue" in value) return null;
   if ("stringValue" in value) return value.stringValue;
-  if ("integerValue" in value) return Number(value.integerValue);
-  if ("doubleValue" in value) return Number(value.doubleValue);
+  if ("integerValue" in value) {
+    const number = Number(value.integerValue);
+    return Number.isSafeInteger(number) ? number : { $integer: String(value.integerValue) };
+  }
+  if ("doubleValue" in value) {
+    const number = Number(value.doubleValue);
+    return Number.isFinite(number) ? number : { $double: String(value.doubleValue) };
+  }
   if ("booleanValue" in value) return Boolean(value.booleanValue);
-  if ("timestampValue" in value) return value.timestampValue;
+  if ("timestampValue" in value) return preserveSpecialTypes ? { $timestamp: value.timestampValue } : value.timestampValue;
+  if ("bytesValue" in value) return { $bytes: value.bytesValue };
+  if ("referenceValue" in value) return { $reference: value.referenceValue };
+  if ("geoPointValue" in value) return { $geoPoint: value.geoPointValue };
+  if ("arrayValue" in value) return (value.arrayValue.values || []).map((child) => firestoreValue(child, preserveSpecialTypes));
   if ("mapValue" in value) {
     const out = {};
-    for (const [key, child] of Object.entries(value.mapValue.fields || {})) out[key] = firestoreValue(child);
+    for (const [key, child] of Object.entries(value.mapValue.fields || {})) out[key] = firestoreValue(child, preserveSpecialTypes);
     return out;
   }
   return null;
@@ -3584,6 +4831,17 @@ function normalizeTransactionId(value) {
   const normalized = String(value || "").trim().replace(/\s+/g, "").toUpperCase();
   if (!/^[A-Z0-9]{6,32}$/.test(normalized)) return "";
   return normalized;
+}
+
+function normalizeWarrantyUnitId(value) {
+  const normalized = String(value || "").trim().replace(/\s+/g, "");
+  return /^[A-Za-z0-9._:-]{2,100}$/.test(normalized) ? normalized : "";
+}
+
+function maskTransactionId(value) {
+  const identifier = String(value || "").trim();
+  if (!identifier) return "—";
+  return identifier.length <= 4 ? "••••" : `••••${identifier.slice(-4)}`;
 }
 
 function unixNow() {

@@ -18,7 +18,7 @@ export type PaymentRow = {
   transaction_id: string; telegram_id: number; amount_bdt: number; provider: string; claimed_at: string;
   username: string | null; first_name: string | null; last_name: string | null;
 };
-export type OrderRow = { id: number; telegram_id: number; product_key: string; variant_key: string | null; quantity: number; charged_bdt: number; provider_order_id: string | null; created_at: string };
+export type OrderRow = { id: number; telegram_id: number; product_key: string; variant_key: string | null; quantity: number; charged_bdt: number; provider_order_id: string | null; fulfillment_source: "api" | "local"; delivery_status: string; delivery_attempts: number | null; created_at: string };
 export type ReferralRow = {
   referred_id: number; referrer_id: number; status: string; created_at: string; completed_at: string | null;
   referred_username: string | null; referred_first_name: string | null; referred_last_name: string | null;
@@ -51,6 +51,27 @@ export type AnnouncementRow = {
 };
 export type PriceRow = { product_key: string; variant_key: string; price_bdt: number; updated_at: string };
 export type CatalogProduct = { productKey: string; name?: string; stock?: number; inStock?: boolean; variants?: Array<{ key: string; name?: string }> };
+export type LocalProduct = {
+  productKey: string; name: string; description: string; warranty: string; deliveryFields: string[];
+  allowBulk: boolean; active: boolean; sortOrder: number; stock: number; delivered: number;
+  inStock: boolean; priceBdt: number | null; source: "local"; createdAt: string; updatedAt: string;
+};
+export type FirebaseConnection = {
+  id: number; projectId: string; databaseId: string; clientEmail: string;
+  status: "active" | "previous" | "archived"; activatedAt: string;
+};
+export type FirestoreStatus = {
+  projectId: string; databaseId: string; clientEmail: string; source: "environment" | "website";
+  activatedAt: string | null; paymentsCollections: string[]; claimsCollection: string;
+  referralsCollection: string; managerCollections: string[]; collections: string[];
+  connections: FirebaseConnection[];
+};
+export type FirestoreDocument = {
+  id: string;
+  fields: Record<string, unknown>;
+  createTime: string;
+  updateTime: string;
+};
 export type SellerApiConfig = {
   provider_name: string;
   base_url: string;
@@ -128,6 +149,20 @@ export async function getCatalog(): Promise<CatalogProduct[]> {
   return (await managerD1<CatalogProduct>("sellerCatalog")).rows;
 }
 
+export async function getLocalProducts() {
+  return (await managerD1<LocalProduct>("localProducts")).rows;
+}
+
+export async function getFirestoreStatus() {
+  const row = (await managerD1<FirestoreStatus>("firestoreStatus")).rows[0];
+  if (!row) throw new Error("The Firestore connection information could not be loaded.");
+  return row;
+}
+
+export async function getFirestoreDocuments(collection: string, documentId?: string) {
+  return (await managerD1<FirestoreDocument>("firestoreDocuments", { collection, documentId })).rows;
+}
+
 export async function getSellerApiConfig() {
   const row = (await managerD1<SellerApiConfig>("sellerApiConfig")).rows[0];
   if (!row) throw new Error("The seller API configuration could not be loaded.");
@@ -151,10 +186,8 @@ async function timedFetch(url: string, init?: RequestInit) {
 }
 
 export async function getHealth() {
-  const workerUrl = process.env.BOT_WORKER_URL?.trim();
-  const worker = workerUrl
-    ? await timedFetch(workerUrl)
-    : { ok: false, status: 0, latency: 0, error: "BOT_WORKER_URL is missing." };
+  const workerUrl = process.env.BOT_WORKER_URL || "https://toolzai-telegram-bot.toolzai.workers.dev";
+  const worker = await timedFetch(workerUrl);
 
   let telegram: Record<string, unknown> = { ok: false, configured: false, message: "TELEGRAM_BOT_TOKEN is missing." };
   if (process.env.TELEGRAM_BOT_TOKEN) {
@@ -165,15 +198,14 @@ export async function getHealth() {
     } else telegram = { ok: false, latency: result.latency, message: result.error };
   }
 
-  const firebaseProject = process.env.FIREBASE_PROJECT_ID?.trim();
-  const firebase = firebaseProject
-    ? await timedFetch(`https://firestore.googleapis.com/v1/projects/${firebaseProject}/databases/(default)/documents/transactions?pageSize=1`)
-    : { ok: false, status: 0, latency: 0, error: "FIREBASE_PROJECT_ID is missing." };
+  const firebaseStatus = await getFirestoreStatus();
+  const healthCollection = firebaseStatus.paymentsCollections[0] || "transactions";
+  const firebase = await timedFetch(`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseStatus.projectId)}/databases/${encodeURIComponent(firebaseStatus.databaseId)}/documents/${encodeURIComponent(healthCollection)}?pageSize=1`);
 
   return {
     worker: { ok: worker.ok, status: worker.status, latency: worker.latency },
     telegram,
-    firebase: { configured: Boolean(firebaseProject), publicRead: firebase.status === 200, status: firebase.status, latency: firebase.latency },
+    firebase: { publicRead: firebase.status === 200, status: firebase.status, latency: firebase.latency },
   };
 }
 

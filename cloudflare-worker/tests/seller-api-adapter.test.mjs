@@ -12,7 +12,7 @@ const config = worker.validateSellerApiConfig({
   authPrefix: "",
   endpoints: worker.SELLER_API_DEFAULT_ENDPOINTS,
   mapping: worker.SELLER_API_DEFAULT_MAPPING,
-}, { apiKey: "seller_test_key" });
+}, { apiKey: "qv_live_example_key" });
 
 const purchaseRequest = worker.sellerRequestDescriptor(config, "/purchase", {
   productKey: "outlook_mail",
@@ -47,9 +47,9 @@ const purchase = worker.normalizeSellerResponse({ success: true, order: {
 assert.equal(purchase.order.orderId, "QV-8F3A21C9");
 assert.equal(purchase.order.items[0].fields[0].value, "someone@outlook.com");
 
-const encrypted = await worker.encryptSellerApiKey("seller_test_secret", "manager-secret-long-enough");
-assert.notEqual(encrypted, "seller_test_secret");
-assert.equal(await worker.decryptSellerApiKey(encrypted, "manager-secret-long-enough"), "seller_test_secret");
+const encrypted = await worker.encryptSellerApiKey("qv_live_super_secret", "manager-secret-long-enough");
+assert.notEqual(encrypted, "qv_live_super_secret");
+assert.equal(await worker.decryptSellerApiKey(encrypted, "manager-secret-long-enough"), "qv_live_super_secret");
 
 const publicConfig = worker.publicSellerApiConfig({ ...config, encryptedApiKey: encrypted, apiKeySource: "manager" });
 assert.equal(publicConfig.api_key_configured, true);

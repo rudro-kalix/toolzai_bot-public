@@ -1,19 +1,18 @@
 # ToolzAI Cloudflare Worker
 
-Production Telegram webhook for an API-based digital product purchasing bot. It uses Cloudflare Workers, D1, a configurable seller REST API, and optional private Firestore payment verification.
+Production Telegram webhook for a digital product purchasing bot. It uses Cloudflare Workers, D1, encrypted local inventory, an optional configurable seller REST API, and optional private Firestore payment verification.
 
 ## Install and validate
 
 ```bash
 npm install
 npm test
-cp wrangler.example.toml wrangler.toml
 npx wrangler deploy --dry-run
 ```
 
 ## Configure your own resources
 
-Create a D1 database, copy `wrangler.example.toml` to the ignored `wrangler.toml`, and replace the example values with your own database ID, admin Telegram ID, support URL, required channel, Firebase project, and seller base URL.
+Create a D1 database and replace the example values in `wrangler.toml` with your own database ID, admin Telegram ID, support URL, required channel, Firebase project, and seller base URL.
 
 ```bash
 npx wrangler d1 create your_bot_database
@@ -40,7 +39,26 @@ Existing installations should apply pending migrations in order. The current sel
 
 ```bash
 npx wrangler d1 execute your_bot_database --remote --file=./migrations/011_seller_api_config.sql
+npx wrangler d1 execute your_bot_database --remote --file=./migrations/012_local_products_inventory.sql
+npx wrangler d1 execute your_bot_database --remote --file=./migrations/013_firebase_project_connections.sql
+npx wrangler d1 execute your_bot_database --remote --file=./migrations/014_warranty_claims.sql
 ```
+
+To enable whole-project Firebase switching from the private manager, set one stable encryption secret. New service-account JSON credentials are tested before activation and encrypted in D1; previous connections remain available for rollback.
+
+```bash
+npx wrangler secret put FIREBASE_CONFIG_ENCRYPTION_KEY
+```
+
+## Encrypted local fulfillment
+
+The manager can create products without an API and upload pipe-delimited or JSON stock rows. The Worker encrypts every row using `INVENTORY_ENCRYPTION_KEY`, falling back to `SELLER_CONFIG_ENCRYPTION_KEY` or `MANAGER_API_SECRET`. In production, set a dedicated stable key; changing it makes existing inventory unreadable.
+
+```bash
+npx wrangler secret put INVENTORY_ENCRYPTION_KEY
+```
+
+Local purchases atomically apply balance deduction, stock claiming, order creation, referral rewards, and the encrypted delivery job. The cron retries transient Telegram delivery failures.
 
 ## Seller API adapter
 

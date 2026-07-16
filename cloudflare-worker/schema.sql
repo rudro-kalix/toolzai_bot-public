@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS user_state (
   bulk_product_key TEXT,
   verify_color TEXT,
   withdrawal_amount_bdt INTEGER,
+  warranty_order_id INTEGER,
+  warranty_unit_id TEXT,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -38,11 +40,92 @@ CREATE TABLE IF NOT EXISTS local_orders (
   quantity INTEGER NOT NULL,
   charged_bdt INTEGER NOT NULL,
   provider_order_id TEXT,
+  fulfillment_source TEXT NOT NULL DEFAULT 'api' CHECK (fulfillment_source IN ('api', 'local')),
   purchase_key TEXT UNIQUE,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_local_orders_telegram_id ON local_orders (telegram_id);
+
+CREATE TABLE IF NOT EXISTS warranty_claims (
+  id TEXT PRIMARY KEY,
+  telegram_id INTEGER NOT NULL,
+  local_order_id INTEGER NOT NULL,
+  product_key TEXT NOT NULL,
+  provider_order_id TEXT,
+  unit_id TEXT,
+  issue_text TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'resolved')),
+  admin_note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  reviewed_at TEXT,
+  reviewed_by TEXT,
+  FOREIGN KEY (local_order_id) REFERENCES local_orders(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_warranty_claims_user_created ON warranty_claims (telegram_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_warranty_claims_status_created ON warranty_claims (status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS local_products (
+  product_key TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  warranty TEXT NOT NULL DEFAULT '',
+  delivery_fields_json TEXT NOT NULL DEFAULT '["Value"]',
+  allow_bulk INTEGER NOT NULL DEFAULT 1 CHECK (allow_bulk IN (0, 1)),
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS local_inventory_items (
+  id TEXT PRIMARY KEY,
+  product_key TEXT NOT NULL,
+  encrypted_payload TEXT NOT NULL,
+  payload_fingerprint TEXT,
+  status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'delivered')),
+  local_order_id INTEGER,
+  delivered_to INTEGER,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  delivered_at TEXT,
+  FOREIGN KEY (product_key) REFERENCES local_products(product_key),
+  FOREIGN KEY (local_order_id) REFERENCES local_orders(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_inventory_available
+  ON local_inventory_items (product_key, status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_local_inventory_fingerprint
+  ON local_inventory_items (product_key, payload_fingerprint) WHERE payload_fingerprint IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS purchase_guards (
+  id TEXT PRIMARY KEY,
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+
+CREATE TABLE IF NOT EXISTS purchase_locks (
+  telegram_id INTEGER PRIMARY KEY,
+  token TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS order_fulfillments (
+  id TEXT PRIMARY KEY,
+  local_order_id INTEGER NOT NULL UNIQUE,
+  telegram_id INTEGER NOT NULL,
+  encrypted_payload TEXT NOT NULL,
+  charged_bdt INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'delivered', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  next_attempt_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  delivered_at TEXT,
+  FOREIGN KEY (local_order_id) REFERENCES local_orders(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_fulfillments_queue
+  ON order_fulfillments (status, next_attempt_at, attempts);
 
 CREATE TABLE IF NOT EXISTS referrals (
   referred_id INTEGER PRIMARY KEY,
@@ -205,6 +288,28 @@ CREATE TABLE IF NOT EXISTS seller_api_config (
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS firebase_project_connections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL,
+  database_id TEXT NOT NULL DEFAULT '(default)',
+  client_email TEXT NOT NULL,
+  encrypted_credentials TEXT NOT NULL,
+  payments_collections TEXT NOT NULL,
+  claims_collection TEXT NOT NULL,
+  referrals_collection TEXT NOT NULL,
+  manager_collections TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL CHECK (status IN ('active', 'previous', 'archived')),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  activated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_firebase_project_connections_active
+  ON firebase_project_connections (status)
+  WHERE status = 'active';
+
+CREATE INDEX IF NOT EXISTS idx_firebase_project_connections_activated
+  ON firebase_project_connections (activated_at DESC, id DESC);
+
 INSERT OR IGNORE INTO seller_api_config
   (id, provider_name, base_url, auth_header, auth_prefix, endpoints_json, mapping_json)
 VALUES
@@ -218,5 +323,5 @@ VALUES
     '{"products":"products","product":"product","order":"order","productKey":"productKey","productName":"name","productDescription":"description","productWarranty":"warranty","productPrice":"price","productStock":"stock","productInStock":"inStock","variants":"variants","variantKey":"key","variantName":"name","variantPrice":"price","variantStock":"stock","variantInStock":"inStock","requestProductKey":"productKey","requestVariantKey":"variantKey","requestQuantity":"quantity","orderId":"orderId,id","orderRequested":"requested","orderFulfilled":"fulfilled","orderItems":"items","itemOrderId":"orderId,id","itemFields":"fields","itemData":"data","fieldName":"name","fieldLabel":"label","fieldValue":"value","errorMessage":"message,error"}'
   );
 
--- Product prices are intentionally not seeded in the public template.
--- Add your own fixed BDT prices through the manager website after deployment.
+INSERT OR IGNORE INTO product_prices (product_key, variant_key, price_bdt, updated_by)
+VALUES ('gemini_18_month_link', '', 495, 7587079688);
