@@ -2,9 +2,13 @@
 
 An API-based Telegram ecommerce bot for selling and automatically delivering digital products, accounts, license keys, subscriptions, and download links. It runs on Cloudflare Workers and D1, supports fixed customer pricing, payment verification, referrals, withdrawals, announcements, and a responsive Next.js admin dashboard.
 
-## See it running
+## 🚀 Try the live bot
 
-Visit the live bot at [telegram.me/toolzai_bot](https://telegram.me/toolzai_bot) to explore the current functionality, including product browsing, live stock, purchases, recharge history, delivered products, and warranty claims.
+[![Open the live bot](https://img.shields.io/badge/OPEN%20THE%20LIVE%20BOT-%40toolzai__bot-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://telegram.me/toolzai_bot)
+
+> **✨ Visit [telegram.me/toolzai_bot](https://telegram.me/toolzai_bot) to see the bot in action.**
+>
+> Browse products, check live stock, make purchases, view recharge history and delivered products, and submit warranty claims.
 
 Keywords: **Telegram shop bot**, **digital product delivery bot**, **API marketplace bot**, **Cloudflare Worker Telegram bot**, **automated digital goods bot**, **Telegram ecommerce**, **D1**, and **Next.js admin dashboard**.
 
