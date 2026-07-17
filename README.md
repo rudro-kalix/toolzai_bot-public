@@ -26,14 +26,32 @@ Keywords: **Telegram shop bot**, **digital product delivery bot**, **API marketp
 - Responsive, password-protected Next.js manager for Vercel
 - Tests that prevent payment amount disclosure and validate seller response mapping
 
+## Instant payment verification with the Android collector
+
+A key companion project—and one of my best projects so far—is the [Android Notification Listener](https://github.com/rudro-kalix/android-notification-listener-main). It supplies this bot with the payment transaction records used for instant balance verification.
+
+The end-to-end flow is:
+
+1. With the device owner's permission, the Android app listens for supported mobile-banking notifications and trusted payment SMS.
+2. It extracts normalized fields such as the payment provider, amount, transaction ID, and timestamp, then syncs them to a private Firestore database. A local queue and retry mechanism help deliver records after temporary network failures.
+3. The customer selects the provider in the Telegram bot, enters the paid amount, and submits the transaction ID.
+4. The Cloudflare Worker securely queries Firestore and checks that the transaction ID exists, the provider matches, and the exact amount is correct.
+5. The bot rejects previously claimed transactions, creates a one-time claim in Firestore and D1, and immediately credits the verified amount to the customer's balance.
+
+This integration supports automatic verification for the bot's configured bKash, Nagad, and Upay payment flows without exposing private Firestore credentials to Telegram users or the browser.
+
 ## Architecture
 
 ```text
+Payment notification/SMS
+    -> Android Notification Listener
+       -> Private Firestore transaction record
+
 Telegram user
     -> Cloudflare Worker webhook
        -> Cloudflare D1 (users, prices, orders, menus, referrals, settings)
        -> Seller API (catalog, purchase, delivery)
-       -> Optional Firestore payment records
+       -> Private Firestore (payment lookup and one-time claim)
 
 Admin browser
     -> Next.js manager on Vercel
