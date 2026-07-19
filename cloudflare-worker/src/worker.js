@@ -6,6 +6,7 @@ const MENU = {
     history: "📜 History",
     refer: "🎁 Refer & Earn",
     support: "📞 Contact Support",
+    redeem: "🎟 Redeem Code",
   },
   bn: {
     products: "🛍️⭐ পণ্য ⭐",
@@ -14,6 +15,7 @@ const MENU = {
     history: "📜 হিস্ট্রি",
     refer: "🎁 রেফার করুন",
     support: "📞 সাপোর্ট",
+    redeem: "🎟 রিডিম কোড",
   },
 };
 
@@ -36,6 +38,9 @@ const PAYMENT_ATTEMPT_LIMIT = 6;
 const BINANCE_PAY_API_BASE_URL = "https://api-gcp.binance.com";
 const BINANCE_PAY_HISTORY_LIMIT = 100;
 const BINANCE_PAY_ALLOWED_ORDER_TYPES = new Set(["PAY", "C2C"]);
+const REDEEM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const REDEEM_ATTEMPT_WINDOW_SECONDS = 10 * 60;
+const REDEEM_ATTEMPT_LIMIT = 8;
 const FIREBASE_TOKEN_EARLY_REFRESH_SECONDS = 5 * 60;
 const MANAGER_REQUEST_MAX_BYTES = 128 * 1024;
 const FIRESTORE_MANAGER_LIST_LIMIT = 50;
@@ -319,7 +324,7 @@ async function handleManagerRequest(request, env, ctx) {
         ? 401
         : safeError === "firestore_document_not_found"
           ? 404
-          : safeError.startsWith("menu_") || safeError.startsWith("invalid_") || safeError.startsWith("seller_") || safeError.startsWith("local_") || safeError.startsWith("firebase_") || safeError.startsWith("firestore_invalid_") || safeError === "withdrawal_not_found"
+          : safeError.startsWith("menu_") || safeError.startsWith("invalid_") || safeError.startsWith("seller_") || safeError.startsWith("local_") || safeError.startsWith("firebase_") || safeError.startsWith("firestore_invalid_") || safeError.startsWith("redeem_") || safeError === "withdrawal_not_found"
             ? 400
             : 500;
     return json({ ok: false, error: safeError }, status);
@@ -558,6 +563,34 @@ async function runManagerOperation(env, payload, ctx = null) {
     };
   }
 
+  if (operation === "createRedeemCode") {
+    const amountBdt = Number(payload?.amountBdt);
+    const maxRedemptions = Number(payload?.maxRedemptions || 1);
+    const expiresAtInput = String(payload?.expiresAt || "").trim();
+    if (!Number.isSafeInteger(amountBdt) || amountBdt < 1 || amountBdt > 10_000_000) {
+      throw new Error("redeem_invalid_amount");
+    }
+    if (!Number.isSafeInteger(maxRedemptions) || maxRedemptions < 1 || maxRedemptions > 100_000) {
+      throw new Error("redeem_invalid_limit");
+    }
+    let expiresAt = null;
+    if (expiresAtInput) {
+      const parsed = Date.parse(expiresAtInput);
+      if (!Number.isFinite(parsed) || parsed <= Date.now() + 60_000) throw new Error("redeem_invalid_expiry");
+      expiresAt = new Date(parsed).toISOString();
+    }
+    const created = await createRedeemCodeRecord(env, { amountBdt, maxRedemptions, expiresAt });
+    return { rows: [created], changes: 1 };
+  }
+
+  if (operation === "disableRedeemCode") {
+    const codeId = String(payload?.codeId || "");
+    if (!/^[0-9a-f-]{36}$/i.test(codeId)) throw new Error("redeem_invalid_id");
+    const result = await env.DB.prepare("UPDATE redeem_codes SET active = 0 WHERE id = ? AND active = 1")
+      .bind(codeId).run();
+    return { rows: [], changes: Number(result.meta?.changes || 0) };
+  }
+
   const reads = {
     overview: `SELECT
       (SELECT COUNT(*) FROM users) AS users,
@@ -608,6 +641,12 @@ async function runManagerOperation(env, payload, ctx = null) {
       ORDER BY CASE withdrawals.status WHEN 'pending' THEN 0 ELSE 1 END, withdrawals.created_at DESC LIMIT 100`,
     announcements: `SELECT id, message_text, button_label, button_url, status, recipient_count, delivered_count,
       failed_count, created_at, started_at, completed_at FROM announcement_campaigns ORDER BY created_at DESC LIMIT 50`,
+    redeemCodes: `SELECT codes.id, codes.code_hint, codes.amount_bdt, codes.max_redemptions, codes.used_count,
+      codes.active, codes.expires_at, codes.created_at, MAX(redemptions.redeemed_at) AS last_redeemed_at
+      FROM redeem_codes AS codes
+      LEFT JOIN redeem_code_redemptions AS redemptions ON redemptions.code_id = codes.id
+      GROUP BY codes.id
+      ORDER BY codes.created_at DESC LIMIT 100`,
     prices: "SELECT product_key, variant_key, price_bdt, updated_at FROM product_prices ORDER BY product_key, variant_key",
   };
 
@@ -935,6 +974,7 @@ function safeManagerError(error) {
   const message = String(error?.message || "operation_failed");
   if (message === "stale_menu_draft" || /^menu_[a-z0-9_]+$/.test(message)) return message;
   if (/^(invalid_announcement|invalid_withdrawal|withdrawal_)[a-z0-9_]*$/.test(message)) return message;
+  if (/^redeem_[a-z0-9_]+$/.test(message)) return message;
   if (/^seller_[a-z0-9_]+$/.test(message)) return message;
   if (/^local_[a-z0-9_]+$/.test(message) || /^invalid_inventory_[a-z0-9_]+$/.test(message)) return message;
   if (/^firebase_[a-z0-9_]+$/.test(message)) return message;
@@ -1774,7 +1814,7 @@ async function handleMessage(message, env) {
   }
 
   const state = await getState(env, user.id);
-  const isMenuNavigation = isAnyMenuText(text) || text === "↩ Main menu" || await isPublishedMenuText(env, text) || await isCustomMenuText(env, text);
+  const isMenuNavigation = isAnyMenuText(text) || text === "/redeem" || text === "↩ Main menu" || await isPublishedMenuText(env, text) || await isCustomMenuText(env, text);
   if (state?.state && isMenuNavigation) {
     await clearState(env, user.id);
   } else if (state?.state === "awaiting_payment_amount") {
@@ -1785,6 +1825,9 @@ async function handleMessage(message, env) {
     return;
   } else if (state?.state === "awaiting_binance_order_id") {
     await handleBinanceOrderId(env, chatId, user.id, text);
+    return;
+  } else if (state?.state === "awaiting_redeem_code") {
+    await handleRedeemCode(env, chatId, user.id, text);
     return;
   } else if (state?.state === "awaiting_bulk_quantity") {
     await handleBulkQuantity(env, chatId, user.id, text, state);
@@ -1808,6 +1851,10 @@ async function handleMessage(message, env) {
   const lang = await getLanguage(env, user.id);
   if (text === "↩ Main menu") {
     await sendMessage(env, chatId, await botText(env, `menu_hint_${lang}`, lang === "bn" ? "নিচের মেনু ব্যবহার করুন 👇" : "Use the menu buttons below 👇"), { reply_markup: await mainKeyboard(env, lang) });
+    return;
+  }
+  if (text === "/redeem" || isMenuText(text, "redeem")) {
+    await startRedeemCode(env, chatId, user.id);
     return;
   }
   if (await handlePublishedMenuButton(env, chatId, user.id, text, lang)) return;
@@ -2042,6 +2089,112 @@ async function welcome(env, chatId, userId) {
   await sendMessage(env, chatId, text, {
     reply_markup: await mainKeyboard(env, lang),
   });
+}
+
+async function startRedeemCode(env, chatId, userId) {
+  const lang = await getLanguage(env, userId);
+  await clearState(env, userId);
+  await setState(env, userId, { state: "awaiting_redeem_code" });
+  await sendMessage(env, chatId, lang === "bn"
+    ? "🎟 <b>রিডিম কোড</b>\n\nআপনার রিডিম কোডটি পাঠান।\nউদাহরণ: <code>TOOLZ-ABCD-EFGH-JKLM</code>"
+    : "🎟 <b>Redeem Code</b>\n\nSend your redeem code.\nExample: <code>TOOLZ-ABCD-EFGH-JKLM</code>");
+}
+
+async function handleRedeemCode(env, chatId, userId, input) {
+  const lang = await getLanguage(env, userId);
+  const code = normalizeRedeemCode(input);
+  if (!code) {
+    await sendMessage(env, chatId, lang === "bn"
+      ? "❌ সঠিক রিডিম কোড পাঠান। উদাহরণ: <code>TOOLZ-ABCD-EFGH-JKLM</code>"
+      : "❌ Send a valid redeem code. Example: <code>TOOLZ-ABCD-EFGH-JKLM</code>");
+    return;
+  }
+  if (!(await consumeRedeemAttempt(env, userId))) {
+    await sendMessage(env, chatId, lang === "bn"
+      ? "⏳ অনেকবার চেষ্টা করা হয়েছে। ১০ মিনিট পর আবার চেষ্টা করুন।"
+      : "⏳ Too many redeem attempts. Please wait 10 minutes and try again.");
+    return;
+  }
+
+  const verifying = await sendMessage(env, chatId, lang === "bn" ? "⏳ <b>কোড যাচাই করা হচ্ছে...</b>" : "⏳ <b>Verifying code...</b>");
+  let result;
+  try {
+    result = await redeemBalanceCode(env, userId, code);
+  } catch (error) {
+    console.error(JSON.stringify({ event: "redeem_code_failed", user_id: userId, error: String(error?.message || error).slice(0, 120) }));
+    result = { status: "unavailable" };
+  } finally {
+    await deleteMessageSafely(env, chatId, verifying?.result?.message_id);
+  }
+
+  if (result.status === "redeemed") {
+    await clearState(env, userId);
+    await sendMessage(env, chatId, lang === "bn"
+      ? `✅ <b>রিডিম সফল হয়েছে!</b>\n\n💵 যোগ হয়েছে: <b>${money(result.amount_bdt)}</b>\n💰 নতুন ব্যালেন্স: <b>${money(result.new_balance_bdt)}</b>`
+      : `✅ <b>Code redeemed successfully!</b>\n\n💵 Added: <b>${money(result.amount_bdt)}</b>\n💰 New balance: <b>${money(result.new_balance_bdt)}</b>`);
+    return;
+  }
+
+  const terminal = ["already_redeemed", "expired", "exhausted", "inactive"].includes(result.status);
+  if (terminal) await clearState(env, userId);
+  const messages = lang === "bn"
+    ? {
+      already_redeemed: "❌ আপনি এই কোডটি আগে ব্যবহার করেছেন।",
+      expired: "❌ এই রিডিম কোডের মেয়াদ শেষ।",
+      exhausted: "❌ এই রিডিম কোডের ব্যবহারসীমা শেষ।",
+      inactive: "❌ এই রিডিম কোডটি বন্ধ করা হয়েছে।",
+      invalid: "❌ রিডিম কোডটি সঠিক নয়। আবার চেষ্টা করুন।",
+      unavailable: "⚠️ এখন রিডিম করা যাচ্ছে না। কিছুক্ষণ পর আবার চেষ্টা করুন।",
+    }
+    : {
+      already_redeemed: "❌ You have already used this redeem code.",
+      expired: "❌ This redeem code has expired.",
+      exhausted: "❌ This redeem code has reached its redemption limit.",
+      inactive: "❌ This redeem code has been disabled.",
+      invalid: "❌ That redeem code is invalid. Please try again.",
+      unavailable: "⚠️ Redemption is temporarily unavailable. Please try again shortly.",
+    };
+  await sendMessage(env, chatId, messages[result.status] || messages.unavailable);
+}
+
+async function redeemBalanceCode(env, userId, code) {
+  const codeHash = await hashRedeemCode(code);
+  const redemptionId = crypto.randomUUID();
+  const results = await env.DB.batch([
+    env.DB.prepare(`INSERT INTO redeem_code_redemptions (id, code_id, telegram_id, amount_bdt)
+      SELECT ?, codes.id, ?, codes.amount_bdt FROM redeem_codes AS codes
+      WHERE codes.code_hash = ? AND codes.active = 1 AND codes.used_count < codes.max_redemptions
+        AND (codes.expires_at IS NULL OR datetime(codes.expires_at) > CURRENT_TIMESTAMP)
+        AND NOT EXISTS (SELECT 1 FROM redeem_code_redemptions WHERE code_id = codes.id AND telegram_id = ?)`)
+      .bind(redemptionId, userId, codeHash, userId),
+    env.DB.prepare(`UPDATE users SET balance_bdt = balance_bdt +
+      (SELECT amount_bdt FROM redeem_code_redemptions WHERE id = ?), updated_at = CURRENT_TIMESTAMP
+      WHERE telegram_id = ? AND EXISTS (SELECT 1 FROM redeem_code_redemptions WHERE id = ?)`)
+      .bind(redemptionId, userId, redemptionId),
+    env.DB.prepare(`UPDATE redeem_codes SET used_count = used_count + 1
+      WHERE id = (SELECT code_id FROM redeem_code_redemptions WHERE id = ?)
+        AND EXISTS (SELECT 1 FROM redeem_code_redemptions WHERE id = ?)`)
+      .bind(redemptionId, redemptionId),
+  ]);
+  if (Number(results[0]?.meta?.changes || 0) === 1) {
+    if (Number(results[1]?.meta?.changes || 0) !== 1 || Number(results[2]?.meta?.changes || 0) !== 1) {
+      throw new Error("redeem_transaction_incomplete");
+    }
+    const redemption = await env.DB.prepare(`SELECT redemptions.amount_bdt, users.balance_bdt AS new_balance_bdt
+      FROM redeem_code_redemptions AS redemptions JOIN users ON users.telegram_id = redemptions.telegram_id
+      WHERE redemptions.id = ?`).bind(redemptionId).first();
+    return { status: "redeemed", amount_bdt: Number(redemption.amount_bdt), new_balance_bdt: Number(redemption.new_balance_bdt) };
+  }
+
+  const existing = await env.DB.prepare(`SELECT codes.active, codes.used_count, codes.max_redemptions, codes.expires_at,
+    EXISTS (SELECT 1 FROM redeem_code_redemptions WHERE code_id = codes.id AND telegram_id = ?) AS user_redeemed
+    FROM redeem_codes AS codes WHERE codes.code_hash = ?`).bind(userId, codeHash).first();
+  if (!existing) return { status: "invalid" };
+  if (Number(existing.user_redeemed || 0) === 1) return { status: "already_redeemed" };
+  if (!Number(existing.active)) return { status: "inactive" };
+  if (existing.expires_at && Date.parse(`${String(existing.expires_at).replace(" ", "T")}Z`) <= Date.now()) return { status: "expired" };
+  if (Number(existing.used_count) >= Number(existing.max_redemptions)) return { status: "exhausted" };
+  return { status: "unavailable" };
 }
 
 async function showProducts(env, chatId, userId) {
@@ -4088,6 +4241,65 @@ async function cachePaymentLookup(env, transactionId, status, payment, ttlSecond
   ).run();
 }
 
+function normalizeRedeemCode(value) {
+  const compact = String(value || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (!compact.startsWith("TOOLZ") || compact.length !== 17) return "";
+  const token = compact.slice(5);
+  if (![...token].every((character) => REDEEM_CODE_ALPHABET.includes(character))) return "";
+  return `TOOLZ-${token.slice(0, 4)}-${token.slice(4, 8)}-${token.slice(8, 12)}`;
+}
+
+async function hashRedeemCode(code) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(code));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function generateRedeemCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(12));
+  const token = [...bytes].map((byte) => REDEEM_CODE_ALPHABET[byte & 31]).join("");
+  return `TOOLZ-${token.slice(0, 4)}-${token.slice(4, 8)}-${token.slice(8, 12)}`;
+}
+
+async function createRedeemCodeRecord(env, { amountBdt, maxRedemptions, expiresAt }) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const code = generateRedeemCode();
+    const codeHash = await hashRedeemCode(code);
+    const codeId = crypto.randomUUID();
+    const codeHint = `TOOLZ-****-****-${code.slice(-4)}`;
+    try {
+      await env.DB.prepare(`INSERT INTO redeem_codes
+        (id, code_hash, code_hint, amount_bdt, max_redemptions, expires_at)
+        VALUES (?, ?, ?, ?, ?, datetime(?))`)
+        .bind(codeId, codeHash, codeHint, amountBdt, maxRedemptions, expiresAt).run();
+      const row = await env.DB.prepare(`SELECT id, code_hint, amount_bdt, max_redemptions, used_count,
+        active, expires_at, created_at FROM redeem_codes WHERE id = ?`).bind(codeId).first();
+      return { ...row, code };
+    } catch (error) {
+      const message = String(error?.message || "").toLowerCase();
+      if (!(message.includes("unique") && message.includes("redeem_codes"))) throw error;
+    }
+  }
+  throw new Error("redeem_generation_failed");
+}
+
+async function consumeRedeemAttempt(env, userId) {
+  const now = unixNow();
+  const windowStart = now - (now % REDEEM_ATTEMPT_WINDOW_SECONDS);
+  const row = await env.DB.prepare("SELECT window_start, attempt_count FROM redeem_attempt_windows WHERE telegram_id = ?")
+    .bind(userId).first();
+  if (!row || Number(row.window_start) !== windowStart) {
+    await env.DB.prepare(`INSERT INTO redeem_attempt_windows (telegram_id, window_start, attempt_count)
+      VALUES (?, ?, 1)
+      ON CONFLICT(telegram_id) DO UPDATE SET window_start = excluded.window_start, attempt_count = 1`)
+      .bind(userId, windowStart).run();
+    return true;
+  }
+  if (Number(row.attempt_count) >= REDEEM_ATTEMPT_LIMIT) return false;
+  await env.DB.prepare("UPDATE redeem_attempt_windows SET attempt_count = attempt_count + 1 WHERE telegram_id = ?")
+    .bind(userId).run();
+  return true;
+}
+
 async function consumePaymentAttempt(env, userId) {
   const now = unixNow();
   const windowStart = now - (now % PAYMENT_ATTEMPT_WINDOW_SECONDS);
@@ -4846,8 +5058,12 @@ async function telegram(env, method, payload) {
 
 async function mainKeyboard(env, language = "en") {
   const published = await loadPublishedMenu(env);
-  if (published) return keyboardForMenuScreen(published, "main", language);
   const m = MENU[language] || MENU.en;
+  if (published) {
+    const keyboard = keyboardForMenuScreen(published, "main", language);
+    const alreadyIncluded = keyboard.keyboard.some((row) => row.some((button) => button.text === m.redeem));
+    return alreadyIncluded ? keyboard : { ...keyboard, keyboard: [...keyboard.keyboard, [{ text: m.redeem }]] };
+  }
   const custom = await env.DB.prepare("SELECT label_en, label_bn FROM bot_menu_buttons WHERE parent_id IS NULL ORDER BY sort_order, id LIMIT 12").all();
   const customRows = chunk((custom.results || []).map((button) => ({ text: language === "bn" ? button.label_bn : button.label_en })), 2);
   return {
@@ -4855,6 +5071,7 @@ async function mainKeyboard(env, language = "en") {
       [{ text: m.products }, { text: m.proxy }],
       [{ text: m.balance }, { text: m.history }],
       [{ text: m.refer }, { text: m.support }],
+      [{ text: m.redeem }],
       ...customRows,
     ],
     resize_keyboard: true,
