@@ -13,7 +13,7 @@ If a credential is exposed in a commit, screenshot, log, issue, or chat, rotate 
 - Restrict admin commands to trusted Telegram numeric IDs.
 - Validate Telegram webhook secret headers and use HTTPS endpoints only.
 - Keep Binance, Telegram, seller, and Firebase credentials in Cloudflare secrets.
-- Prevent an Order ID from being claimed more than once and keep migration `015_binance_pay.sql` applied.
+- Prevent Order IDs and mobile-wallet transaction IDs from being claimed more than once; keep migrations `015_binance_pay.sql` and `016_restore_mobile_payments.sql` applied.
 - Give D1, Firebase, and seller credentials the least privileges needed.
 - Review Worker logs without recording credentials or payment data.
 - Rotate secrets periodically and immediately after suspected exposure.

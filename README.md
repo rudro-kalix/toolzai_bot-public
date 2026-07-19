@@ -11,6 +11,8 @@ An open-source Telegram digital-product store bot built on Cloudflare Workers an
 - Telegram command menu with `/start` for restarting the bot
 - Human verification shown only until a user has successfully verified
 - Product browsing, fixed BDT prices, balance purchases, order history, and warranty claims
+- bKash, Nagad, and Upay balance deposits with exact-amount Firestore verification
+- Rocket remains visible as temporarily unavailable until an account is configured
 - Binance Pay (USDT) balance deposits using only the customer's Order ID
 - Server-side Binance transaction lookup, exact received-amount crediting, and one-time Order ID claims
 - Temporary `Verifying...` feedback that is deleted after payment verification finishes
@@ -52,7 +54,7 @@ For a new database:
 npx wrangler d1 execute digital_product_bot --remote --file=./schema.sql
 ```
 
-For an existing deployment, apply the ordered files in `migrations/`, including `015_binance_pay.sql`.
+For an existing deployment, apply the ordered files in `migrations/`, including `015_binance_pay.sql` and `016_restore_mobile_payments.sql`.
 
 ### 3. Store secrets in Cloudflare
 
@@ -81,9 +83,9 @@ Set the webhook after deployment:
 TELEGRAM_BOT_TOKEN=your-token node scripts/set-webhook.mjs "https://YOUR-WORKER.workers.dev" "YOUR_WEBHOOK_SECRET"
 ```
 
-## Binance Pay verification
+## Payment verification
 
-The user opens Add Balance, sees only Binance Pay instructions, completes a USDT payment, and sends the Binance Order ID. The Worker queries successful incoming Binance Pay transactions, verifies the Order ID, reads the exact amount, prevents reuse, converts it using the configured rate, and credits the user's balance. API credentials remain in Cloudflare Worker secrets and are never sent to Telegram clients.
+Add Balance offers Binance Pay, bKash, Nagad, and Upay, with Rocket shown as temporarily unavailable. Mobile-wallet payments are matched against private Firestore transaction records using the selected provider, entered amount, and transaction ID. Binance Pay queries successful incoming USDT transactions using the submitted Order ID. Both flows prevent reuse, show a temporary `Verifying...` message, and delete it when verification finishes.
 
 ## Security
 
