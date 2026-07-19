@@ -20,6 +20,7 @@ const originalFetch = globalThis.fetch;
 try {
   globalThis.fetch = async (url, init) => {
     const requestUrl = new URL(url);
+    assert.equal(requestUrl.origin, "https://api-gcp.binance.com");
     assert.equal(requestUrl.pathname, "/sapi/v1/pay/transactions");
     assert.equal(init.headers["X-MBX-APIKEY"], "read-only-key");
     assert.equal(requestUrl.searchParams.get("limit"), "100");
