@@ -45,6 +45,8 @@ for (const provider of ["bkash", "nagad", "rocket", "upay", "binance"]) {
 }
 assert.match(source, /Referrals Bonus: <b>\$\{Number\(referralWallet\.available_bdt \|\| 0\)\.toFixed\(2\)\}<\/b>/);
 assert.match(source, /\+100 taka<\/b> per Purchase from refferal/);
+assert.match(source, /copy_text:\s*{\s*text:\s*payId\s*}/);
+assert.match(source, /copy_text:\s*{\s*text:\s*account\s*}/);
 assert.doesNotMatch(source, /BINANCE_(?:API|SECRET)_KEY\s*=\s*["'][^"']+/);
 
 console.log("Payment verification privacy checks passed.");

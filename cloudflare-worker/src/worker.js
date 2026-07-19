@@ -204,6 +204,7 @@ const PAYMENT_ACCOUNTS = Object.freeze({
 });
 
 const ACTIVE_PAYMENT_PROVIDERS = Object.freeze(["bkash", "nagad", "upay"]);
+const PAYMENT_PROVIDER_LABELS = Object.freeze({ bkash: "bKash", nagad: "Nagad", upay: "Upay" });
 
 const BOT_SETTING_RULES = Object.freeze({
   welcome_en: "text", welcome_bn: "text",
@@ -2311,7 +2312,12 @@ async function selectPaymentProvider(env, chatId, userId, provider) {
     const fallback = lang === "bn"
       ? `💳 <b>Binance Pay দিয়ে ব্যালেন্স যোগ করুন</b>\n\n📱 <b>Binance Pay ID:</b>\n<code>${escapeHtml(payId)}</code>\n\n⚠️ <b>নির্দেশনা:</b>\n1️⃣ Binance App খুলুন\n2️⃣ Pay → Send এ যান\n3️⃣ উপরের Pay ID দিন\n4️⃣ USDT amount দিন\n5️⃣ পেমেন্ট সম্পন্ন করুন\n6️⃣ Binance থেকে Order ID কপি করুন\n7️⃣ শুধু Order ID এখানে পাঠান\n\n📝 <b>এখন আপনার Binance Order ID পাঠান:</b>`
       : `💳 <b>Add Balance via Binance Pay</b>\n\n📱 <b>Binance Pay ID:</b>\n<code>${escapeHtml(payId)}</code>\n\n⚠️ <b>Instructions:</b>\n1️⃣ Open Binance App\n2️⃣ Go to Pay → Send\n3️⃣ Enter the Pay ID above\n4️⃣ Enter the USDT amount\n5️⃣ Complete payment\n6️⃣ Copy the Order ID from Binance\n7️⃣ Send the Order ID here (just the ID)\n\n📝 <b>Now reply with your Binance Order ID:</b>`;
-    await sendMessage(env, chatId, await botText(env, `binance_payment_provider_${lang}`, fallback, { pay_id: payId }));
+    await sendMessage(env, chatId, await botText(env, `binance_payment_provider_${lang}`, fallback, { pay_id: payId }), {
+      reply_markup: { inline_keyboard: [[{
+        text: lang === "bn" ? "📋 Binance Pay ID কপি করুন" : "📋 Copy Binance Pay ID",
+        copy_text: { text: payId },
+      }]] },
+    });
     return;
   }
   if (!ACTIVE_PAYMENT_PROVIDERS.includes(provider)) {
@@ -2328,13 +2334,19 @@ async function selectPaymentProvider(env, chatId, userId, provider) {
     return;
   }
   await setState(env, userId, { state: "awaiting_payment_amount", payment_provider: provider });
+  const providerLabel = PAYMENT_PROVIDER_LABELS[provider] || provider.toUpperCase();
   const fallback = lang === "bn"
-    ? `💳 <b>${provider.toUpperCase()}</b>\n\nSend Money করুন: <code>${escapeHtml(account)}</code>\nAccount type: Personal\n\nBDT-তে পেমেন্ট এমাউন্ট লিখুন।\nউদাহরণ: <code>500</code>`
-    : `💳 <b>${provider.toUpperCase()}</b>\n\nSend Money to: <code>${escapeHtml(account)}</code>\nAccount type: Personal\n\nSend the payment amount in BDT.\nExample: <code>500</code>`;
+    ? `💳 <b>${providerLabel}</b>\n\nSend Money করুন: <code>${escapeHtml(account)}</code>\nAccount type: Personal\n\nBDT-তে পেমেন্ট এমাউন্ট লিখুন।\nউদাহরণ: <code>500</code>`
+    : `💳 <b>${providerLabel}</b>\n\nSend Money to: <code>${escapeHtml(account)}</code>\nAccount type: Personal\n\nSend the payment amount in BDT.\nExample: <code>500</code>`;
   await sendMessage(env, chatId, await botText(env, `payment_provider_${lang}`, fallback, {
-    provider: provider.toUpperCase(),
+    provider: providerLabel,
     account,
-  }));
+  }), {
+    reply_markup: { inline_keyboard: [[{
+      text: lang === "bn" ? `📋 ${providerLabel} নম্বর কপি করুন` : `📋 Copy ${providerLabel} number`,
+      copy_text: { text: account },
+    }]] },
+  });
 }
 
 async function handlePaymentAmount(env, chatId, userId, text, state) {
