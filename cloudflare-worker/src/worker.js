@@ -2027,17 +2027,20 @@ async function verifyColor(env, chatId, userId, selected) {
 }
 
 async function welcome(env, chatId, userId) {
-  const [profile, balance, referralWallet] = await Promise.all([
+  const [profile, balance, referralWallet, lang] = await Promise.all([
     env.DB.prepare("SELECT username, first_name, last_name FROM users WHERE telegram_id = ?").bind(userId).first(),
     getBalance(env, userId),
     getReferralWalletSummary(env, userId),
+    getLanguage(env, userId),
   ]);
   const username = profile?.username
     ? `@${profile.username}`
     : [profile?.first_name, profile?.last_name].filter(Boolean).join(" ") || String(userId);
-  const text = `🎉 <b>Welcome to ToolzAI Bot!</b>\n\n👤 Username: <b>${escapeHtml(username)}</b>\n💰 Balance: <b>${Number(balance || 0).toFixed(2)}</b>\n💎 Referrals Bonus: <b>${Number(referralWallet.available_bdt || 0).toFixed(2)}</b>\n\n━━━━━━━━━━━━━━━━━━\n🎁 <b>REFER &amp; EARN REWARDS!</b>\n━━━━━━━━━━━━━━━━━━\n\n✨ <b>Share your link &amp; earn:</b>\n• 💎 <b>+100 taka</b> per Purchase from refferal\n\n🚀 Tap <b>“🎁 Refer &amp; Earn”</b> to get your link!\n━━━━━━━━━━━━━━━━━━\n\nUse the buttons below to navigate 👇`;
+  const text = lang === "bn"
+    ? `🎉 <b>ToolzAI Bot-এ স্বাগতম!</b>\n\n👤 ইউজারনেম: <b>${escapeHtml(username)}</b>\n💰 ব্যালেন্স: <b>${Number(balance || 0).toFixed(2)}</b>\n💎 রেফারেল বোনাস: <b>${Number(referralWallet.available_bdt || 0).toFixed(2)}</b>\n\n━━━━━━━━━━━━━━━━━━\n🎁 <b>রেফার করে পুরস্কার জিতুন!</b>\n━━━━━━━━━━━━━━━━━━\n\n✨ <b>আপনার লিংক শেয়ার করে আয় করুন:</b>\n• 💎 রেফার করা ইউজারের প্রতিটি কেনাকাটায় <b>+100 টাকা</b>\n\n🚀 আপনার লিংক পেতে <b>“🎁 রেফার করে আয় করুন”</b> চাপুন!\n━━━━━━━━━━━━━━━━━━\n\nনিচের বাটনগুলো ব্যবহার করুন 👇`
+    : `🎉 <b>Welcome to ToolzAI Bot!</b>\n\n👤 Username: <b>${escapeHtml(username)}</b>\n💰 Balance: <b>${Number(balance || 0).toFixed(2)}</b>\n💎 Referrals Bonus: <b>${Number(referralWallet.available_bdt || 0).toFixed(2)}</b>\n\n━━━━━━━━━━━━━━━━━━\n🎁 <b>REFER &amp; EARN REWARDS!</b>\n━━━━━━━━━━━━━━━━━━\n\n✨ <b>Share your link &amp; earn:</b>\n• 💎 <b>+100 taka</b> per Purchase from refferal\n\n🚀 Tap <b>“🎁 Refer &amp; Earn”</b> to get your link!\n━━━━━━━━━━━━━━━━━━\n\nUse the buttons below to navigate 👇`;
   await sendMessage(env, chatId, text, {
-    reply_markup: await mainKeyboard(env, await getLanguage(env, userId)),
+    reply_markup: await mainKeyboard(env, lang),
   });
 }
 

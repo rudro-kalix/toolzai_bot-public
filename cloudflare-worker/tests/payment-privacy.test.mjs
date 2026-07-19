@@ -45,6 +45,11 @@ for (const provider of ["bkash", "nagad", "rocket", "upay", "binance"]) {
 }
 assert.match(source, /Referrals Bonus: <b>\$\{Number\(referralWallet\.available_bdt \|\| 0\)\.toFixed\(2\)\}<\/b>/);
 assert.match(source, /\+100 taka<\/b> per Purchase from refferal/);
+assert.match(source, /const text = lang === "bn"/);
+assert.match(source, /ToolzAI Bot-এ স্বাগতম!/);
+assert.match(source, /রেফারেল বোনাস:/);
+assert.match(source, /রেফার করা ইউজারের প্রতিটি কেনাকাটায় <b>\+100 টাকা<\/b>/);
+assert.match(source, /reply_markup: await mainKeyboard\(env, lang\)/);
 assert.doesNotMatch(source, /copy_text\s*:/);
 assert.match(source, /<code>\$\{escapeHtml\(payId\)\}<\/code>/);
 assert.match(source, /<code>\$\{escapeHtml\(account\)\}<\/code>/);
