@@ -151,9 +151,9 @@ const MENU_RESPONSE_DEFINITIONS = Object.freeze({
   binance_payment_provider: {
     label: "Binance Pay instructions",
     setting: "binance_payment_provider",
-    variables: ["pay_id"],
-    en: "💳 Add Balance via Binance Pay\n\n📱 Binance Pay ID:\n{{pay_id}}\n\n⚠️ Instructions:\n1️⃣ Open Binance App\n2️⃣ Go to Pay → Send\n3️⃣ Enter the Pay ID above\n4️⃣ Enter the USDT amount\n5️⃣ Complete payment\n6️⃣ Copy the Order ID from Binance\n7️⃣ Send the Order ID here (just the ID)\n\n📝 Now reply with your Binance Order ID:",
-    bn: "💳 Binance Pay দিয়ে ব্যালেন্স যোগ করুন\n\n📱 Binance Pay ID:\n{{pay_id}}\n\n⚠️ নির্দেশনা:\n1️⃣ Binance App খুলুন\n2️⃣ Pay → Send এ যান\n3️⃣ উপরের Pay ID দিন\n4️⃣ USDT amount দিন\n5️⃣ পেমেন্ট সম্পন্ন করুন\n6️⃣ Binance থেকে Order ID কপি করুন\n7️⃣ শুধু Order ID এখানে পাঠান\n\n📝 এখন আপনার Binance Order ID পাঠান:",
+    variables: ["pay_id", "rate"],
+    en: "💳 Add Balance via Binance Pay\n\n📱 Binance Pay ID:\n{{pay_id}}\n💱 Rate: 1 USDT = {{rate}}\n\n⚠️ Instructions:\n1️⃣ Open Binance App\n2️⃣ Go to Pay → Send\n3️⃣ Enter the Pay ID above\n4️⃣ Enter the USDT amount\n5️⃣ Complete payment\n6️⃣ Copy the Order ID from Binance\n7️⃣ Send the Order ID here (just the ID)\n\n📝 Now reply with your Binance Order ID:",
+    bn: "💳 Binance Pay দিয়ে ব্যালেন্স যোগ করুন\n\n📱 Binance Pay ID:\n{{pay_id}}\n💱 রেট: 1 USDT = {{rate}}\n\n⚠️ নির্দেশনা:\n1️⃣ Binance App খুলুন\n2️⃣ Pay → Send এ যান\n3️⃣ উপরের Pay ID দিন\n4️⃣ USDT amount দিন\n5️⃣ পেমেন্ট সম্পন্ন করুন\n6️⃣ Binance থেকে Order ID কপি করুন\n7️⃣ শুধু Order ID এখানে পাঠান\n\n📝 এখন আপনার Binance Order ID পাঠান:",
   },
   history: {
     label: "Purchase history",
@@ -929,10 +929,12 @@ async function runManagerOperation(env, payload, ctx = null) {
   if (operation === "setBalance") {
     const telegramId = Number(payload?.telegramId);
     const balanceBdt = Number(payload?.balanceBdt);
+    const roundedBalanceBdt = Math.round(balanceBdt * 100) / 100;
     if (!Number.isSafeInteger(telegramId) || telegramId < 1) throw new Error("invalid_telegram_id");
-    if (!Number.isSafeInteger(balanceBdt) || balanceBdt < 0 || balanceBdt > 100_000_000) throw new Error("invalid_balance");
+    if (!Number.isFinite(balanceBdt) || balanceBdt < 0 || balanceBdt > 100_000_000
+      || Math.abs(balanceBdt - roundedBalanceBdt) > Number.EPSILON * 100) throw new Error("invalid_balance");
     const query = await env.DB.prepare("UPDATE users SET balance_bdt = ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ?")
-      .bind(balanceBdt, telegramId).run();
+      .bind(roundedBalanceBdt, telegramId).run();
     return { rows: [], changes: Number(query.meta?.changes || 0) };
   }
 
@@ -1452,6 +1454,7 @@ async function buildMenuActionPreview(env, menu, request) {
   if (callbackData === "pay_provider:binance") {
     return previewResult(menu, "binance_payment_provider", language, {
       pay_id: binancePayId(env),
+      rate: money(binanceUsdtRate(env)),
     }, [], { warning: "Preview only — no payment state was changed." });
   }
   if (callbackData.startsWith("pay_provider:")) {
@@ -2474,16 +2477,23 @@ async function selectPaymentProvider(env, chatId, userId, provider) {
   if (provider === "binance") {
     await setState(env, userId, { state: "awaiting_binance_order_id", payment_provider: "binance_pay" });
     const payId = binancePayId(env);
+    const rate = money(binanceUsdtRate(env));
     const fallback = lang === "bn"
-      ? `💳 <b>Binance Pay দিয়ে ব্যালেন্স যোগ করুন</b>\n\n📱 <b>Binance Pay ID:</b>\n<code>${escapeHtml(payId)}</code>\n\n⚠️ <b>নির্দেশনা:</b>\n1️⃣ Binance App খুলুন\n2️⃣ Pay → Send এ যান\n3️⃣ উপরের Pay ID দিন\n4️⃣ USDT amount দিন\n5️⃣ পেমেন্ট সম্পন্ন করুন\n6️⃣ Binance থেকে Order ID কপি করুন\n7️⃣ শুধু Order ID এখানে পাঠান\n\n📝 <b>এখন আপনার Binance Order ID পাঠান:</b>`
-      : `💳 <b>Add Balance via Binance Pay</b>\n\n📱 <b>Binance Pay ID:</b>\n<code>${escapeHtml(payId)}</code>\n\n⚠️ <b>Instructions:</b>\n1️⃣ Open Binance App\n2️⃣ Go to Pay → Send\n3️⃣ Enter the Pay ID above\n4️⃣ Enter the USDT amount\n5️⃣ Complete payment\n6️⃣ Copy the Order ID from Binance\n7️⃣ Send the Order ID here (just the ID)\n\n📝 <b>Now reply with your Binance Order ID:</b>`;
-    await sendMessage(env, chatId, await botText(
+      ? `💳 <b>Binance Pay দিয়ে ব্যালেন্স যোগ করুন</b>\n\n📱 <b>Binance Pay ID:</b>\n<code>${escapeHtml(payId)}</code>\n💱 <b>রেট:</b> 1 USDT = ${rate}\n\n⚠️ <b>নির্দেশনা:</b>\n1️⃣ Binance App খুলুন\n2️⃣ Pay → Send এ যান\n3️⃣ উপরের Pay ID দিন\n4️⃣ USDT amount দিন\n5️⃣ পেমেন্ট সম্পন্ন করুন\n6️⃣ Binance থেকে Order ID কপি করুন\n7️⃣ শুধু Order ID এখানে পাঠান\n\n📝 <b>এখন আপনার Binance Order ID পাঠান:</b>`
+      : `💳 <b>Add Balance via Binance Pay</b>\n\n📱 <b>Binance Pay ID:</b>\n<code>${escapeHtml(payId)}</code>\n💱 <b>Rate:</b> 1 USDT = ${rate}\n\n⚠️ <b>Instructions:</b>\n1️⃣ Open Binance App\n2️⃣ Go to Pay → Send\n3️⃣ Enter the Pay ID above\n4️⃣ Enter the USDT amount\n5️⃣ Complete payment\n6️⃣ Copy the Order ID from Binance\n7️⃣ Send the Order ID here (just the ID)\n\n📝 <b>Now reply with your Binance Order ID:</b>`;
+    let instructions = await botText(
       env,
       `binance_payment_provider_${lang}`,
       fallback,
-      { pay_id: payId },
-      ["pay_id"],
-    ));
+      { pay_id: payId, rate },
+      ["pay_id", "rate"],
+    );
+    if (!instructions.includes(rate)) {
+      instructions += lang === "bn"
+        ? `\n\n💱 <b>রেট:</b> 1 USDT = ${rate}`
+        : `\n\n💱 <b>Rate:</b> 1 USDT = ${rate}`;
+    }
+    await sendMessage(env, chatId, instructions);
     return;
   }
   if (!ACTIVE_PAYMENT_PROVIDERS.includes(provider)) {
@@ -2700,12 +2710,18 @@ function normalizePositiveUsdt(value) {
 }
 
 function binanceUsdtToBalance(env, amountUsdt) {
-  const rate = Number(env.BINANCE_USDT_TO_BDT_RATE || 121);
-  const credited = Math.round(Number(amountUsdt) * rate);
-  if (!Number.isFinite(rate) || rate <= 0 || !Number.isSafeInteger(credited) || credited < 1) {
+  const rate = binanceUsdtRate(env);
+  const credited = Math.round(Number(amountUsdt) * rate * 100) / 100;
+  if (!Number.isFinite(credited) || credited < 0.01) {
     throw new Error("binance_invalid_conversion_rate");
   }
   return credited;
+}
+
+function binanceUsdtRate(env) {
+  const rate = Number(env.BINANCE_USDT_TO_BDT_RATE || 121);
+  if (!Number.isFinite(rate) || rate <= 0) throw new Error("binance_invalid_conversion_rate");
+  return rate;
 }
 
 function binancePayId(env) {
@@ -5186,8 +5202,8 @@ function isAnyMenuText(text) {
 }
 
 function money(value) {
-  const amount = Math.round(Number(value) || 0);
-  return `Tk ${amount.toLocaleString("en-US")}`;
+  const amount = Math.round((Number(value) || 0) * 100) / 100;
+  return `Tk ${amount.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 async function getFixedPrices(env, productKey) {

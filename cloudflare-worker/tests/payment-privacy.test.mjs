@@ -56,7 +56,7 @@ assert.match(source, /<code>\$\{escapeHtml\(account\)\}<\/code>/);
 assert.match(source, /codeVariableNames\.has\(name\)/);
 assert.match(source, /\.replaceAll\(placeholder, `<code>\$\{escapedValue\}<\/code>`\)/);
 assert.match(source, /\["bkash", "nagad", "upay"\]/);
-assert.match(source, /\["pay_id"\]/);
+assert.match(source, /\["pay_id", "rate"\]/);
 assert.match(source, /\["account"\]/);
 assert.doesNotMatch(source, /BINANCE_(?:API|SECRET)_KEY\s*=\s*["'][^"']+/);
 

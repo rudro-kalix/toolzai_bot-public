@@ -3,15 +3,18 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 
 const source = fs.readFileSync(new URL("../src/worker.js", import.meta.url), "utf8");
-const exposed = `${source}\nexport { findBinancePayTransaction, hmacSha256Hex, normalizePositiveUsdt, binanceUsdtToBalance };`;
+const exposed = `${source}\nexport { findBinancePayTransaction, hmacSha256Hex, normalizePositiveUsdt, binanceUsdtToBalance, money };`;
 const worker = await import(`data:text/javascript;base64,${Buffer.from(exposed).toString("base64")}`);
 
 assert.equal(worker.normalizePositiveUsdt("0.55000000"), "0.55");
 assert.equal(worker.normalizePositiveUsdt("12"), "12");
 assert.equal(worker.normalizePositiveUsdt("-1"), "");
 assert.equal(worker.normalizePositiveUsdt("1.123456789"), "");
-assert.equal(worker.binanceUsdtToBalance({ BINANCE_USDT_TO_BDT_RATE: "132" }, "0.55"), 73);
+assert.equal(worker.binanceUsdtToBalance({ BINANCE_USDT_TO_BDT_RATE: "132" }, "0.55"), 72.6);
 assert.equal(worker.binanceUsdtToBalance({}, "1"), 121);
+assert.equal(worker.binanceUsdtToBalance({ BINANCE_USDT_TO_BDT_RATE: "121" }, "0.001"), 0.12);
+assert.equal(worker.money(0.12), "Tk 0.12");
+assert.equal(worker.money(505), "Tk 505.00");
 
 const expectedHmac = crypto.createHmac("sha256", "secret").update("message").digest("hex");
 assert.equal(await worker.hmacSha256Hex("secret", "message"), expectedHmac);

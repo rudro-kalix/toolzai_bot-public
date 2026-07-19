@@ -33,7 +33,7 @@ npx wrangler secret put BINANCE_API_KEY
 npx wrangler secret put BINANCE_SECRET_KEY
 ```
 
-The Binance key needs read-only user-data access for `GET /sapi/v1/pay/transactions`; do not enable trading or withdrawals. Set the public `BINANCE_PAY_ID` and the `BINANCE_USDT_TO_BDT_RATE` conversion value in `wrangler.toml`. Submitted Binance Pay Order IDs are matched against successful incoming USDT Pay history, claimed once, and converted into the bot's whole-BDT balance at that configured rate.
+The Binance key needs read-only user-data access for `GET /sapi/v1/pay/transactions`; do not enable trading or withdrawals. Set the public `BINANCE_PAY_ID` and the `BINANCE_USDT_TO_BDT_RATE` conversion value in `wrangler.toml`. Submitted Binance Pay Order IDs are matched against successful incoming USDT Pay history, claimed once, and converted at that configured rate to two BDT decimal places.
 
 `SELLER_CONFIG_ENCRYPTION_KEY` is optional. When omitted, the Worker derives seller-key encryption from `MANAGER_API_SECRET`.
 
