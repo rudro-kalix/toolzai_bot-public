@@ -33,7 +33,8 @@ try {
       success: true,
       data: [{
         orderType: "C2C",
-        transactionId: "443329294882152448",
+        orderId: "443759545054887936",
+        transactionId: "M_C2C_1784478441114",
         transactionTime: 1784448000000,
         amount: "0.55000000",
         currency: "USDT",
@@ -44,13 +45,17 @@ try {
   const payment = await worker.findBinancePayTransaction({
     BINANCE_API_KEY: "read-only-key",
     BINANCE_SECRET_KEY: "secret",
-  }, "443329294882152448");
+  }, "443759545054887936");
   assert.deepEqual(payment, {
-    transaction_id: "443329294882152448",
+    transaction_id: "M_C2C_1784478441114",
     transaction_time: 1784448000000,
     amount_usdt: "0.55",
     order_type: "C2C",
   });
+  assert.deepEqual(await worker.findBinancePayTransaction({
+    BINANCE_API_KEY: "read-only-key",
+    BINANCE_SECRET_KEY: "secret",
+  }, "M_C2C_1784478441114"), payment);
   assert.equal(await worker.findBinancePayTransaction({
     BINANCE_API_KEY: "read-only-key",
     BINANCE_SECRET_KEY: "secret",

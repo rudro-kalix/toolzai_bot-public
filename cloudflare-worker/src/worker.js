@@ -2655,6 +2655,25 @@ async function handleBinanceOrderId(env, chatId, userId, transactionId) {
 }
 
 async function findBinancePayTransaction(env, orderId) {
+  const transactions = await loadBinancePayTransactions(env);
+  const transaction = transactions.find((item) =>
+    normalizeTransactionId(item?.orderId) === orderId
+    || normalizeTransactionId(item?.transactionId) === orderId);
+  if (!transaction) return null;
+  const canonicalTransactionId = normalizeTransactionId(transaction.transactionId);
+  const amountUsdt = normalizePositiveUsdt(transaction.amount);
+  const orderType = String(transaction.orderType || "").toUpperCase();
+  if (!canonicalTransactionId || !amountUsdt || String(transaction.currency || "").toUpperCase() !== "USDT"
+    || !BINANCE_PAY_ALLOWED_ORDER_TYPES.has(orderType)) return null;
+  return {
+    transaction_id: canonicalTransactionId,
+    transaction_time: Number(transaction.transactionTime || 0),
+    amount_usdt: amountUsdt,
+    order_type: orderType,
+  };
+}
+
+async function loadBinancePayTransactions(env) {
   const apiKey = String(env.BINANCE_API_KEY || "").trim();
   const secretKey = String(env.BINANCE_SECRET_KEY || "").trim();
   if (!apiKey || !secretKey) throw new Error("binance_not_configured");
@@ -2673,20 +2692,7 @@ async function findBinancePayTransaction(env, orderId) {
   if (!response.ok || payload?.success === false || (payload?.code && payload.code !== "000000")) {
     throw new Error(`binance_api_${response.status}_${String(payload?.code || "unknown").slice(0, 32)}`);
   }
-
-  const transaction = (Array.isArray(payload?.data) ? payload.data : []).find((item) =>
-    normalizeTransactionId(item?.transactionId) === orderId);
-  if (!transaction) return null;
-  const amountUsdt = normalizePositiveUsdt(transaction.amount);
-  const orderType = String(transaction.orderType || "").toUpperCase();
-  if (!amountUsdt || String(transaction.currency || "").toUpperCase() !== "USDT"
-    || !BINANCE_PAY_ALLOWED_ORDER_TYPES.has(orderType)) return null;
-  return {
-    transaction_id: String(transaction.transactionId),
-    transaction_time: Number(transaction.transactionTime || 0),
-    amount_usdt: amountUsdt,
-    order_type: orderType,
-  };
+  return Array.isArray(payload?.data) ? payload.data : [];
 }
 
 async function hmacSha256Hex(secret, message) {
