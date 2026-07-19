@@ -2527,7 +2527,7 @@ function normalizePositiveUsdt(value) {
 }
 
 function binanceUsdtToBalance(env, amountUsdt) {
-  const rate = Number(env.BINANCE_USDT_TO_BDT_RATE || 132);
+  const rate = Number(env.BINANCE_USDT_TO_BDT_RATE || 121);
   const credited = Math.round(Number(amountUsdt) * rate);
   if (!Number.isFinite(rate) || rate <= 0 || !Number.isSafeInteger(credited) || credited < 1) {
     throw new Error("binance_invalid_conversion_rate");

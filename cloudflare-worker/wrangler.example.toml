@@ -17,7 +17,7 @@ database_id = "00000000-0000-0000-0000-000000000000"
 [vars]
 QUANTUM_VAULT_BASE_URL = "https://your-seller-api.example"
 BINANCE_PAY_ID = "your-binance-pay-id"
-BINANCE_USDT_TO_BDT_RATE = "132"
+BINANCE_USDT_TO_BDT_RATE = "121"
 FIREBASE_PROJECT_ID = "your-firebase-project-id"
 FIREBASE_PAYMENT_COLLECTION = "payments"
 ADMIN_IDS = "123456789"

@@ -11,6 +11,7 @@ assert.equal(worker.normalizePositiveUsdt("12"), "12");
 assert.equal(worker.normalizePositiveUsdt("-1"), "");
 assert.equal(worker.normalizePositiveUsdt("1.123456789"), "");
 assert.equal(worker.binanceUsdtToBalance({ BINANCE_USDT_TO_BDT_RATE: "132" }, "0.55"), 73);
+assert.equal(worker.binanceUsdtToBalance({}, "1"), 121);
 
 const expectedHmac = crypto.createHmac("sha256", "secret").update("message").digest("hex");
 assert.equal(await worker.hmacSha256Hex("secret", "message"), expectedHmac);
