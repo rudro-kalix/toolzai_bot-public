@@ -1283,21 +1283,30 @@ async function paymentAccount(env, provider) {
   return botSettingValue(env, `payment_${provider}`, PAYMENT_ACCOUNTS[provider] || "");
 }
 
-async function botText(env, key, fallback, variables = {}) {
+async function botText(env, key, fallback, variables = {}, codeVariables = []) {
   const row = await env.DB.prepare("SELECT value FROM bot_settings WHERE key = ?").bind(key).first();
   if (!row?.value) return fallback;
-  return renderEditableBotText(row.value, variables);
+  return renderEditableBotText(row.value, variables, codeVariables);
 }
 
-function renderEditableBotText(template, variables = {}) {
+function renderEditableBotText(template, variables = {}, codeVariables = []) {
   let rendered = escapeHtml(String(template || "").trim());
   rendered = rendered
     .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>")
     .replace(/__([^_\n]+)__/g, "<i>$1</i>")
     .replace(/~~([^~\n]+)~~/g, "<s>$1</s>")
     .replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  const codeVariableNames = new Set(codeVariables);
   for (const [name, value] of Object.entries(variables)) {
-    rendered = rendered.replaceAll(escapeHtml(`{{${name}}}`), escapeHtml(value));
+    const placeholder = escapeHtml(`{{${name}}}`);
+    const escapedValue = escapeHtml(value);
+    if (codeVariableNames.has(name)) {
+      rendered = rendered
+        .replaceAll(`<code>${placeholder}</code>`, `<code>${escapedValue}</code>`)
+        .replaceAll(placeholder, `<code>${escapedValue}</code>`);
+    } else {
+      rendered = rendered.replaceAll(placeholder, escapedValue);
+    }
   }
   return polishOutgoingMessage(rendered);
 }
@@ -2286,7 +2295,7 @@ async function addBalancePrompt(env, chatId, userId) {
   const instructions = await botText(env, `payment_intro_${lang}`, fallback, {
     balance: money(balance),
     ...accounts,
-  });
+  }, ["bkash", "nagad", "upay"]);
   await sendMessage(env, chatId, instructions, {
     reply_markup: {
       inline_keyboard: [
@@ -2312,7 +2321,13 @@ async function selectPaymentProvider(env, chatId, userId, provider) {
     const fallback = lang === "bn"
       ? `💳 <b>Binance Pay দিয়ে ব্যালেন্স যোগ করুন</b>\n\n📱 <b>Binance Pay ID:</b>\n<code>${escapeHtml(payId)}</code>\n\n⚠️ <b>নির্দেশনা:</b>\n1️⃣ Binance App খুলুন\n2️⃣ Pay → Send এ যান\n3️⃣ উপরের Pay ID দিন\n4️⃣ USDT amount দিন\n5️⃣ পেমেন্ট সম্পন্ন করুন\n6️⃣ Binance থেকে Order ID কপি করুন\n7️⃣ শুধু Order ID এখানে পাঠান\n\n📝 <b>এখন আপনার Binance Order ID পাঠান:</b>`
       : `💳 <b>Add Balance via Binance Pay</b>\n\n📱 <b>Binance Pay ID:</b>\n<code>${escapeHtml(payId)}</code>\n\n⚠️ <b>Instructions:</b>\n1️⃣ Open Binance App\n2️⃣ Go to Pay → Send\n3️⃣ Enter the Pay ID above\n4️⃣ Enter the USDT amount\n5️⃣ Complete payment\n6️⃣ Copy the Order ID from Binance\n7️⃣ Send the Order ID here (just the ID)\n\n📝 <b>Now reply with your Binance Order ID:</b>`;
-    await sendMessage(env, chatId, await botText(env, `binance_payment_provider_${lang}`, fallback, { pay_id: payId }));
+    await sendMessage(env, chatId, await botText(
+      env,
+      `binance_payment_provider_${lang}`,
+      fallback,
+      { pay_id: payId },
+      ["pay_id"],
+    ));
     return;
   }
   if (!ACTIVE_PAYMENT_PROVIDERS.includes(provider)) {
@@ -2336,7 +2351,7 @@ async function selectPaymentProvider(env, chatId, userId, provider) {
   await sendMessage(env, chatId, await botText(env, `payment_provider_${lang}`, fallback, {
     provider: providerLabel,
     account,
-  }));
+  }, ["account"]));
 }
 
 async function handlePaymentAmount(env, chatId, userId, text, state) {

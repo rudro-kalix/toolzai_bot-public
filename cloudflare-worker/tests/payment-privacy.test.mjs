@@ -48,6 +48,11 @@ assert.match(source, /\+100 taka<\/b> per Purchase from refferal/);
 assert.doesNotMatch(source, /copy_text\s*:/);
 assert.match(source, /<code>\$\{escapeHtml\(payId\)\}<\/code>/);
 assert.match(source, /<code>\$\{escapeHtml\(account\)\}<\/code>/);
+assert.match(source, /codeVariableNames\.has\(name\)/);
+assert.match(source, /\.replaceAll\(placeholder, `<code>\$\{escapedValue\}<\/code>`\)/);
+assert.match(source, /\["bkash", "nagad", "upay"\]/);
+assert.match(source, /\["pay_id"\]/);
+assert.match(source, /\["account"\]/);
 assert.doesNotMatch(source, /BINANCE_(?:API|SECRET)_KEY\s*=\s*["'][^"']+/);
 
 console.log("Payment verification privacy checks passed.");
