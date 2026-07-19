@@ -28,14 +28,10 @@ for (const leakedResponse of [
   assert.doesNotMatch(handler, new RegExp(leakedResponse.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
 }
 
-for (const privateReason of [
-  "local_claim_exists",
-  "payment_not_found",
-  "provider_mismatch",
-  "amount_mismatch",
-  "firestore_claim_exists",
-]) {
-  assert.match(handler, new RegExp(`recordPaymentVerificationRejection\\(env, chatId, userId, "${privateReason}"\\)`));
-}
+assert.match(handler, /findBinancePayTransaction\(env, normalized\)/);
+assert.match(handler, /"payment_not_found"/);
+assert.match(handler, /finally\s*{\s*await deleteMessageSafely/s);
+assert.doesNotMatch(handler, /findFirestorePayment|firestoreClaimExists|createFirestoreClaim/);
+assert.doesNotMatch(source, /BINANCE_(?:API|SECRET)_KEY\s*=\s*["'][^"']+/);
 
 console.log("Payment verification privacy checks passed.");

@@ -1,6 +1,6 @@
 # Seller API configuration
 
-The Worker separates the bot from the seller's API contract. When a seller changes its domain, endpoints, authentication, request field names, or response structure, update the adapter from the manager's **Seller API** page instead of editing and redeploying the Worker.
+The Worker separates the bot from the seller's API contract. When a seller changes its domain, endpoints, authentication, request field names, or response structure, update the adapter from the separately maintained private manager's **Seller API** page instead of editing and redeploying the Worker. The manager website is not included in this public repository.
 
 ## Safe update process
 

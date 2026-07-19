@@ -33,6 +33,9 @@ const PAYMENT_NOT_FOUND_CACHE_TTL_SECONDS = 20;
 const PAYMENT_INVALID_CACHE_TTL_SECONDS = 6 * 60 * 60;
 const PAYMENT_ATTEMPT_WINDOW_SECONDS = 5 * 60;
 const PAYMENT_ATTEMPT_LIMIT = 6;
+const BINANCE_PAY_API_BASE_URL = "https://api.binance.com";
+const BINANCE_PAY_HISTORY_LIMIT = 100;
+const BINANCE_PAY_ALLOWED_ORDER_TYPES = new Set(["PAY", "C2C"]);
 const FIREBASE_TOKEN_EARLY_REFRESH_SECONDS = 5 * 60;
 const MANAGER_REQUEST_MAX_BYTES = 128 * 1024;
 const FIRESTORE_MANAGER_LIST_LIMIT = 50;
@@ -129,16 +132,16 @@ const MENU_RESPONSE_DEFINITIONS = Object.freeze({
   payment_intro: {
     label: "Add balance instructions",
     setting: "payment_intro",
-    variables: ["bkash", "nagad", "upay"],
-    en: "➕ Add Balance\n\nAvailable payment options:\n\n• bKash: {{bkash}} (Send Money)\n• Nagad: {{nagad}} (Send Money)\n• Rocket: temporarily unavailable\n• Upay: {{upay}} (Send Money)\n\nAll are personal accounts.\n\nChoose your payment method:",
-    bn: "➕ ব্যালেন্স যোগ করুন\n\nপেমেন্ট অপশন:\n\n• bKash: {{bkash}} (Send Money)\n• Nagad: {{nagad}} (Send Money)\n• Rocket: সাময়িকভাবে বন্ধ\n• Upay: {{upay}} (Send Money)\n\nপেমেন্ট পদ্ধতি বাছুন:",
+    variables: ["balance"],
+    en: "💰 Add Balance\n\n💵 Current Balance: {{balance}}\n\n⚠️ IMPORTANT — Please Read Before Paying ⚠️\n\n⭐ Use Binance Pay (USDT) only.\n🚫 Do not send another coin; other assets cannot be credited.\n\n👇 Select the payment method:",
+    bn: "💰 ব্যালেন্স যোগ করুন\n\n💵 বর্তমান ব্যালেন্স: {{balance}}\n\n⚠️ পেমেন্টের আগে পড়ুন ⚠️\n\n⭐ শুধুমাত্র Binance Pay (USDT) ব্যবহার করুন।\n🚫 অন্য কোনো কয়েন পাঠাবেন না; অন্য asset credit করা যাবে না।\n\n👇 পেমেন্ট পদ্ধতি বাছুন:",
   },
   payment_provider: {
-    label: "Payment provider prompt",
+    label: "Binance Pay instructions",
     setting: "payment_provider",
-    variables: ["provider", "account"],
-    en: "💳 {{provider}}\n\nSend Money to: {{account}}\nAccount type: Personal\n\nSend the payment amount in BDT.\nExample: 500",
-    bn: "💳 {{provider}}\n\nSend Money করুন: {{account}}\nAccount type: Personal\n\nBDT-তে পেমেন্ট এমাউন্ট লিখুন।\nউদাহরণ: 500",
+    variables: ["pay_id"],
+    en: "💳 Add Balance via Binance Pay\n\n📱 Binance Pay ID:\n{{pay_id}}\n\n⚠️ Instructions:\n1️⃣ Open Binance App\n2️⃣ Go to Pay → Send\n3️⃣ Enter the Pay ID above\n4️⃣ Enter the USDT amount\n5️⃣ Complete payment\n6️⃣ Copy the Order ID from Binance\n7️⃣ Send the Order ID here (just the ID)\n\n📝 Now reply with your Binance Order ID:",
+    bn: "💳 Binance Pay দিয়ে ব্যালেন্স যোগ করুন\n\n📱 Binance Pay ID:\n{{pay_id}}\n\n⚠️ নির্দেশনা:\n1️⃣ Binance App খুলুন\n2️⃣ Pay → Send এ যান\n3️⃣ উপরের Pay ID দিন\n4️⃣ USDT amount দিন\n5️⃣ পেমেন্ট সম্পন্ন করুন\n6️⃣ Binance থেকে Order ID কপি করুন\n7️⃣ শুধু Order ID এখানে পাঠান\n\n📝 এখন আপনার Binance Order ID পাঠান:",
   },
   history: {
     label: "Purchase history",
@@ -186,14 +189,6 @@ const MENU_RESPONSE_DEFINITIONS = Object.freeze({
 
 let firebaseTokenCache = null;
 
-const PAYMENT_ACCOUNTS = {
-  bkash: "01607656890",
-  nagad: "01607656890",
-  upay: "01607656890",
-};
-
-const ACTIVE_PAYMENT_PROVIDERS = ["bkash", "nagad", "upay"];
-
 const BOT_SETTING_RULES = Object.freeze({
   welcome_en: "text", welcome_bn: "text",
   join_required_en: "text", join_required_bn: "text",
@@ -211,7 +206,6 @@ const BOT_SETTING_RULES = Object.freeze({
   refer_en: "text", refer_bn: "text",
   referral_terms_en: "long_text", referral_terms_bn: "long_text",
   support_url: "telegram_url",
-  payment_bkash: "phone", payment_nagad: "phone", payment_upay: "phone",
 });
 
 const MENU_ACTIONS = new Set([
@@ -1267,10 +1261,6 @@ async function botSettingValue(env, key, fallback) {
   return row?.value || fallback;
 }
 
-async function paymentAccount(env, provider) {
-  return botSettingValue(env, `payment_${provider}`, PAYMENT_ACCOUNTS[provider] || "");
-}
-
 async function botText(env, key, fallback, variables = {}) {
   const row = await env.DB.prepare("SELECT value FROM bot_settings WHERE key = ?").bind(key).first();
   if (!row?.value) return fallback;
@@ -1388,18 +1378,9 @@ async function buildMenuActionPreview(env, menu, request) {
   if (callbackData === "add_balance") return previewPaymentIntroAction(env, menu, language);
   if (callbackData === "referral:dashboard") return previewReferralAction(env, menu, language, adminId);
   if (callbackData === "referral:terms") return previewReferralTermsAction(menu, language);
-  if (callbackData.startsWith("pay_provider:")) {
-    const provider = callbackData.slice("pay_provider:".length);
-    if (!ACTIVE_PAYMENT_PROVIDERS.includes(provider)) {
-      return previewResult(menu, null, language, {}, [], {
-        text: language === "bn" ? "এই পেমেন্ট পদ্ধতি সাময়িকভাবে বন্ধ।" : "This payment method is temporarily unavailable.",
-        warning: "Preview only — no payment state was changed.",
-      });
-    }
-    const account = await paymentAccount(env, provider);
+  if (callbackData === "pay_provider:binance") {
     return previewResult(menu, "payment_provider", language, {
-      provider: provider.toUpperCase(),
-      account,
+      pay_id: binancePayId(env),
     }, [], { warning: "Preview only — no payment state was changed." });
   }
 
@@ -1575,19 +1556,10 @@ async function previewProductDetailAction(env, menu, language, adminId, productK
 }
 
 async function previewPaymentIntroAction(env, menu, language) {
-  const accounts = {
-    bkash: await paymentAccount(env, "bkash"),
-    nagad: await paymentAccount(env, "nagad"),
-    upay: await paymentAccount(env, "upay"),
-  };
-  return previewResult(menu, "payment_intro", language, accounts, [
+  const balance = await getBalance(env, Number(csv(env.ADMIN_IDS)[0] || 0));
+  return previewResult(menu, "payment_intro", language, { balance: money(balance) }, [
     [
-      { label: "🟥 bKash", kind: "callback", value: "pay_provider:bkash" },
-      { label: "🟧 NAGAD", kind: "callback", value: "pay_provider:nagad" },
-    ],
-    [
-      { label: "🟪 Rocket unavailable", kind: "disabled", value: "" },
-      { label: "🟨 upay", kind: "callback", value: "pay_provider:upay" },
+      { label: "💳 Binance Pay (USDT) ⭐ Recommended", kind: "callback", value: "pay_provider:binance" },
     ],
   ]);
 }
@@ -1700,7 +1672,12 @@ async function handleMessage(message, env) {
     const referrerId = parseStartReferrer(text, user.id);
     if (referrerId) await recordPendingReferral(env, user.id, referrerId);
     await clearState(env, user.id);
-    await startLanguageSelection(env, chatId);
+    const existing = await env.DB.prepare("SELECT human_verified FROM users WHERE telegram_id = ?").bind(user.id).first();
+    if (existing?.human_verified) {
+      if (await ensureChannelMembership(env, chatId, user.id)) await welcome(env, chatId, user.id);
+    } else {
+      await startLanguageSelection(env, chatId);
+    }
     return;
   }
 
@@ -1745,10 +1722,7 @@ async function handleMessage(message, env) {
   const isMenuNavigation = isAnyMenuText(text) || text === "↩ Main menu" || await isPublishedMenuText(env, text) || await isCustomMenuText(env, text);
   if (state?.state && isMenuNavigation) {
     await clearState(env, user.id);
-  } else if (state?.state === "awaiting_payment_amount") {
-    await handlePaymentAmount(env, chatId, user.id, text, state);
-    return;
-  } else if (state?.state === "awaiting_transaction_id") {
+  } else if (state?.state === "awaiting_binance_order_id") {
     await handleTransactionId(env, chatId, user.id, text, state);
     return;
   } else if (state?.state === "awaiting_bulk_quantity") {
@@ -1813,7 +1787,7 @@ async function handleCallback(query, env) {
     const lang = data.split(":")[1] === "bn" ? "bn" : "en";
     await setLanguage(env, userId, lang);
     if (await ensureChannelMembership(env, chatId, userId)) {
-      await startHumanVerification(env, chatId, userId);
+      await continueAfterMembership(env, chatId, userId);
     }
     return;
   }
@@ -1821,7 +1795,7 @@ async function handleCallback(query, env) {
   if (data === "check_channel_join") {
     if (await ensureChannelMembership(env, chatId, userId)) {
       await sendMessage(env, chatId, "✅ Thanks for joining! Setting things up...");
-      await startHumanVerification(env, chatId, userId);
+      await continueAfterMembership(env, chatId, userId);
     }
     return;
   }
@@ -1905,6 +1879,15 @@ async function ensureAccess(env, chatId, userId) {
   return false;
 }
 
+async function continueAfterMembership(env, chatId, userId) {
+  const row = await env.DB.prepare("SELECT human_verified FROM users WHERE telegram_id = ?").bind(userId).first();
+  if (row?.human_verified) {
+    await welcome(env, chatId, userId);
+    return;
+  }
+  await startHumanVerification(env, chatId, userId);
+}
+
 async function ensureChannelMembership(env, chatId, userId) {
   if (await isRequiredChannelMember(env, userId)) {
     await completePendingReferral(env, userId);
@@ -1984,11 +1967,18 @@ async function verifyColor(env, chatId, userId, selected) {
 
 async function welcome(env, chatId, userId) {
   const lang = await getLanguage(env, userId);
-  const balance = await getBalance(env, userId);
+  const [profile, balance, credits] = await Promise.all([
+    env.DB.prepare("SELECT username, first_name, last_name FROM users WHERE telegram_id = ?").bind(userId).first(),
+    getBalance(env, userId),
+    getReferralCount(env, userId),
+  ]);
+  const username = profile?.username
+    ? `@${profile.username}`
+    : [profile?.first_name, profile?.last_name].filter(Boolean).join(" ") || String(userId);
   const fallback = lang === "bn"
-    ? `🎉 <b>ToolzAI Bot-এ স্বাগতম!</b>\n\n👤 User ID: <b>${userId}</b>\n💵 আপনার ব্যালেন্স: <b>${money(balance)}</b>\n\nনিচের বাটন ব্যবহার করুন 👇`
-    : `🎉 <b>Welcome to ToolzAI Bot!</b>\n\n👤 User ID: <b>${userId}</b>\n💵 Your Balance: <b>${money(balance)}</b>\n\nUse the buttons below to navigate 👇`;
-  await sendMessage(env, chatId, await botText(env, `welcome_${lang}`, fallback, { user_id: userId, balance: money(balance) }), {
+    ? `🎉 <b>ToolzAI Bot-এ স্বাগতম!</b>\n\n👤 Username: <b>${escapeHtml(username)}</b>\n💰 Balance: <b>${money(balance)}</b>\n💎 Credits: <b>${credits}</b>\n\n━━━━━━━━━━━━━━━━━━━━\n🎁 <b>REFER &amp; EARN REWARDS!</b>\n━━━━━━━━━━━━━━━━━━━━\n\n✨ আপনার লিংক শেয়ার করে আয় করুন:\n• 💎 প্রতিটি referral আমাদের channel-এ join করলে +1 Credit\n\n🚀 লিংক পেতে “🎁 Refer &amp; Earn” চাপুন।\n━━━━━━━━━━━━━━━━━━━━\n\nনিচের বাটন ব্যবহার করুন 👇`
+    : `🎉 <b>Welcome to ToolzAI Bot!</b>\n\n👤 Username: <b>${escapeHtml(username)}</b>\n💰 Balance: <b>${money(balance)}</b>\n💎 Credits: <b>${credits}</b>\n\n━━━━━━━━━━━━━━━━━━━━\n🎁 <b>REFER &amp; EARN REWARDS!</b>\n━━━━━━━━━━━━━━━━━━━━\n\n✨ Share your link and earn:\n• 💎 +1 Credit per referral (after they join our channel!)\n\n🚀 Tap “🎁 Refer &amp; Earn” to get your link.\n━━━━━━━━━━━━━━━━━━━━\n\nUse the buttons below to navigate 👇`;
+  await sendMessage(env, chatId, await botText(env, `payment_intro_${lang}`, fallback, { balance: money(balance) }), {
     reply_markup: await mainKeyboard(env, lang),
   });
 }
@@ -2234,26 +2224,14 @@ async function showBalance(env, chatId, userId) {
 async function addBalancePrompt(env, chatId, userId) {
   const lang = await getLanguage(env, userId);
   await clearState(env, userId);
-  const accounts = {
-    bkash: await paymentAccount(env, "bkash"),
-    nagad: await paymentAccount(env, "nagad"),
-    upay: await paymentAccount(env, "upay"),
-  };
+  const balance = await getBalance(env, userId);
   const fallback = lang === "bn"
-    ? `➕ <b>ব্যালেন্স যোগ করুন</b>\n\n<b>উপলব্ধ পেমেন্ট অপশন:</b>\n\n• bKash: <code>${accounts.bkash}</code> (Send Money)\n• Nagad: <code>${accounts.nagad}</code> (Send Money)\n• Rocket: সাময়িকভাবে বন্ধ\n• Upay: <code>${accounts.upay}</code> (Send Money)\n\nসবগুলো Personal Account.\n\nপেমেন্ট পদ্ধতি বাছুন:`
-    : `➕ <b>Add Balance</b>\n\n<b>Available payment options:</b>\n\n• bKash: <code>${accounts.bkash}</code> (Send Money)\n• Nagad: <code>${accounts.nagad}</code> (Send Money)\n• Rocket: temporarily unavailable\n• Upay: <code>${accounts.upay}</code> (Send Money)\n\nAll are personal accounts.\n\nChoose your payment method:`;
-  const instructions = await botText(env, `payment_intro_${lang}`, fallback, accounts);
-  await sendMessage(env, chatId, instructions, {
+    ? `💰 <b>ব্যালেন্স যোগ করুন</b>\n\n💵 বর্তমান ব্যালেন্স: <b>${money(balance)}</b>\n\n⚠️ <b>পেমেন্টের আগে পড়ুন</b> ⚠️\n\n⭐ শুধুমাত্র 👉 <b>Binance Pay (USDT)</b> ব্যবহার করুন ✅\n\n🚫 USDT ছাড়া অন্য কোনো coin পাঠাবেন না — অন্য asset credit করা যাবে না ❌\n\n👇 পেমেন্ট পদ্ধতি বাছুন:`
+    : `💰 <b>Add Balance</b>\n\n💵 Current Balance: <b>${money(balance)}</b>\n\n⚠️ <b>IMPORTANT — Please Read Before Paying</b> ⚠️\n\n⭐ Use 👉 <b>Binance Pay (USDT)</b> only ✅\n\n🚫 Do not send any coin other than USDT — other assets cannot be credited ❌\n\n👇 Select the payment method:`;
+  await sendMessage(env, chatId, fallback, {
     reply_markup: {
       inline_keyboard: [
-        [
-          { text: "🟥 bKash", callback_data: "pay_provider:bkash" },
-          { text: "🟧 NAGAD", callback_data: "pay_provider:nagad" },
-        ],
-        [
-          { text: "🟪 Rocket unavailable", callback_data: "pay_provider:rocket" },
-          { text: "🟨 upay", callback_data: "pay_provider:upay" },
-        ],
+        [{ text: "💳 Binance Pay (USDT) ⭐ Recommended", callback_data: "pay_provider:binance" }],
       ],
     },
   });
@@ -2261,89 +2239,158 @@ async function addBalancePrompt(env, chatId, userId) {
 
 async function selectPaymentProvider(env, chatId, userId, provider) {
   const lang = await getLanguage(env, userId);
-  if (!ACTIVE_PAYMENT_PROVIDERS.includes(provider)) {
+  if (provider !== "binance") {
     await clearState(env, userId);
     await sendMessage(env, chatId, lang === "bn"
-      ? "❌ এই পেমেন্ট মেথডটি সাময়িকভাবে বন্ধ আছে। অনুগ্রহ করে bKash, NAGAD অথবা upay ব্যবহার করুন।"
-      : "❌ This payment method is temporarily unavailable. Please use bKash, NAGAD, or upay.");
+      ? "❌ শুধুমাত্র Binance Pay (USDT) ব্যবহার করা যাবে।"
+      : "❌ Only Binance Pay (USDT) is available.");
     return;
   }
-  await setState(env, userId, { state: "awaiting_payment_amount", payment_provider: provider });
-  const account = await paymentAccount(env, provider);
+  await setState(env, userId, { state: "awaiting_binance_order_id", payment_provider: "binance_pay" });
+  const payId = binancePayId(env);
   const fallback = lang === "bn"
-    ? `💳 <b>${provider.toUpperCase()}</b>\n\nSend Money করুন: <code>${account}</code>\nAccount type: Personal\n\nBDT-তে পেমেন্ট এমাউন্ট লিখুন।\nউদাহরণ: <code>500</code>`
-    : `💳 <b>${provider.toUpperCase()}</b>\n\nSend Money to: <code>${account}</code>\nAccount type: Personal\n\nSend the payment amount in BDT.\nExample: <code>500</code>`;
-  await sendMessage(env, chatId, await botText(env, `payment_provider_${lang}`, fallback, {
-    provider: provider.toUpperCase(),
-    account,
-  }));
+    ? `💳 <b>Binance Pay দিয়ে ব্যালেন্স যোগ করুন</b>\n\n📱 <b>Binance Pay ID:</b>\n<code>${escapeHtml(payId)}</code>\n\n⚠️ <b>নির্দেশনা:</b>\n1️⃣ Binance App খুলুন\n2️⃣ Pay → Send এ যান\n3️⃣ উপরের Pay ID দিন\n4️⃣ USDT amount দিন\n5️⃣ পেমেন্ট সম্পন্ন করুন\n6️⃣ Binance থেকে Order ID কপি করুন\n7️⃣ শুধু Order ID এখানে পাঠান\n\n📝 <b>এখন আপনার Binance Order ID পাঠান:</b>`
+    : `💳 <b>Add Balance via Binance Pay</b>\n\n📱 <b>Binance Pay ID:</b>\n<code>${escapeHtml(payId)}</code>\n\n⚠️ <b>Instructions:</b>\n1️⃣ Open Binance App\n2️⃣ Go to Pay → Send\n3️⃣ Enter the Pay ID above\n4️⃣ Enter the USDT amount\n5️⃣ Complete payment\n6️⃣ Copy the Order ID from Binance\n7️⃣ Send the Order ID here (just the ID)\n\n📝 <b>Now reply with your Binance Order ID:</b>`;
+  await sendMessage(env, chatId, await botText(env, `payment_provider_${lang}`, fallback, { pay_id: payId }));
 }
 
-async function handlePaymentAmount(env, chatId, userId, text, state) {
-  const amount = Math.round(Number(text.replaceAll(",", "")));
-  if (!Number.isFinite(amount) || amount <= 0) {
-    await sendMessage(env, chatId, "❌ Send a valid BDT amount, for example: 500");
-    return;
-  }
-  await setState(env, userId, { state: "awaiting_transaction_id", payment_provider: state.payment_provider, payment_amount_bdt: amount });
-  await sendMessage(env, chatId, `✅ Amount set: <b>${money(amount)}</b>\n\nNow send your <b>${state.payment_provider.toUpperCase()}</b> transaction ID.`);
-}
-
-async function handleTransactionId(env, chatId, userId, transactionId, state) {
+async function handleTransactionId(env, chatId, userId, transactionId) {
   const normalized = normalizeTransactionId(transactionId);
   if (!normalized) {
-    await sendMessage(env, chatId, "❌ Send a valid transaction ID.");
+    await sendMessage(env, chatId, "❌ Send a valid Binance Order ID.");
     return;
   }
   if (!(await consumePaymentAttempt(env, userId))) {
-    await sendMessage(env, chatId, "❌ Too many transaction ID checks. Please wait 5 minutes and try again.");
+    await sendMessage(env, chatId, "❌ Too many order checks. Please wait 5 minutes and try again.");
     return;
   }
-  const localClaim = await env.DB.prepare("SELECT 1 FROM claimed_payments WHERE transaction_id = ?").bind(normalized).first();
-  if (localClaim) {
-    await recordPaymentVerificationRejection(env, chatId, userId, "local_claim_exists");
-    return;
-  }
+  const verifying = await sendMessage(env, chatId, "⏳ <b>Verifying...</b>");
+  let outcome = null;
   try {
-    const payment = await findFirestorePayment(env, normalized);
-    if (!payment) {
-      await recordPaymentVerificationRejection(env, chatId, userId, "payment_not_found");
-      return;
+    const localClaim = await env.DB.prepare("SELECT 1 FROM claimed_payments WHERE transaction_id = ?").bind(normalized).first();
+    if (localClaim) {
+      outcome = { kind: "rejected", reason: "local_claim_exists" };
+    } else {
+      const payment = await findBinancePayTransaction(env, normalized);
+      if (!payment) {
+        outcome = { kind: "rejected", reason: "payment_not_found" };
+      } else {
+        const creditedBdt = binanceUsdtToBalance(env, payment.amount_usdt);
+        await env.DB.batch([
+          env.DB.prepare(`INSERT INTO claimed_payments
+            (transaction_id, telegram_id, amount_bdt, provider, source_document, amount_usdt)
+            VALUES (?, ?, ?, 'binance_pay', ?, ?)`)
+            .bind(payment.transaction_id, userId, creditedBdt, String(payment.transaction_time || ""), payment.amount_usdt),
+          env.DB.prepare("UPDATE users SET balance_bdt = balance_bdt + ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ?")
+            .bind(creditedBdt, userId),
+        ]);
+        const newBalance = await getBalance(env, userId);
+        await clearState(env, userId);
+        outcome = { kind: "verified", payment, creditedBdt, newBalance };
+      }
     }
-    const expectedProvider = state.payment_provider;
-    const expectedAmount = Number(state.payment_amount_bdt || 0);
-    const actualAmount = Math.round(payment.amount_bdt);
-    if (payment.provider !== expectedProvider) {
-      await recordPaymentVerificationRejection(env, chatId, userId, "provider_mismatch");
-      return;
-    }
-    if (actualAmount !== expectedAmount) {
-      await recordPaymentVerificationRejection(env, chatId, userId, "amount_mismatch");
-      return;
-    }
-    if (await firestoreClaimExists(env, normalized)) {
-      await recordPaymentVerificationRejection(env, chatId, userId, "firestore_claim_exists");
-      return;
-    }
-    await createFirestoreClaim(env, payment, userId, actualAmount);
-    await env.DB.prepare("INSERT INTO claimed_payments (transaction_id, telegram_id, amount_bdt, provider, source_document) VALUES (?, ?, ?, ?, ?)")
-      .bind(payment.transaction_id, userId, actualAmount, payment.provider, payment.document_name)
-      .run();
-    const newBalance = await addBalance(env, userId, actualAmount);
-    await clearState(env, userId);
-    await sendMessage(env, chatId, `✅ <b>Payment verified</b>\n\n🏦 Provider: <b>${payment.provider.toUpperCase()}</b>\n💳 Amount: <b>${money(actualAmount)}</b>\n💵 Credited: <b>${money(actualAmount)}</b>\n💰 New balance: <b>${money(newBalance)}</b>`);
   } catch (error) {
-    if (error.message === "invalid_payment_provider" || error.message === "This transaction ID was already used.") {
-      await recordPaymentVerificationRejection(env, chatId, userId, "invalid_or_already_claimed");
-      return;
-    }
     console.error(JSON.stringify({
-      event: "payment_verification_backend_failed",
+      event: "binance_payment_verification_failed",
       user_id: userId,
-      error: error?.message || String(error),
+      error: safeBinanceError(error),
     }));
+    outcome = isDuplicateClaimError(error)
+      ? { kind: "rejected", reason: "local_claim_exists" }
+      : { kind: "unavailable" };
+  } finally {
+    await deleteMessageSafely(env, chatId, verifying?.result?.message_id);
+  }
+
+  if (outcome?.kind === "verified") {
+    await sendMessage(env, chatId, `💰 <b>Payment Verified Successfully!</b>\n\n✅ Amount: <b>${escapeHtml(outcome.payment.amount_usdt)} USDT</b>\n📋 Order ID: <code>${escapeHtml(outcome.payment.transaction_id)}</code>\n💵 Credited: <b>${money(outcome.creditedBdt)}</b>\n💰 New Balance: <b>${money(outcome.newBalance)}</b>\n\nThank you for your payment! 🎉`);
+  } else if (outcome?.kind === "rejected") {
+    await recordPaymentVerificationRejection(env, chatId, userId, outcome.reason);
+  } else {
     await sendPaymentVerificationUnavailable(env, chatId, userId);
   }
+}
+
+async function findBinancePayTransaction(env, orderId) {
+  const apiKey = String(env.BINANCE_API_KEY || "").trim();
+  const secretKey = String(env.BINANCE_SECRET_KEY || "").trim();
+  if (!apiKey || !secretKey) throw new Error("binance_not_configured");
+
+  const params = new URLSearchParams({
+    limit: String(BINANCE_PAY_HISTORY_LIMIT),
+    recvWindow: "5000",
+    timestamp: String(Date.now()),
+  });
+  const signature = await hmacSha256Hex(secretKey, params.toString());
+  params.set("signature", signature);
+  const response = await fetch(`${BINANCE_PAY_API_BASE_URL}/sapi/v1/pay/transactions?${params}`, {
+    headers: { "X-MBX-APIKEY": apiKey },
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload?.success === false || (payload?.code && payload.code !== "000000")) {
+    throw new Error(`binance_api_${response.status}_${String(payload?.code || "unknown").slice(0, 32)}`);
+  }
+
+  const transaction = (Array.isArray(payload?.data) ? payload.data : []).find((item) =>
+    normalizeTransactionId(item?.transactionId) === orderId);
+  if (!transaction) return null;
+  const amountUsdt = normalizePositiveUsdt(transaction.amount);
+  const orderType = String(transaction.orderType || "").toUpperCase();
+  if (!amountUsdt || String(transaction.currency || "").toUpperCase() !== "USDT"
+    || !BINANCE_PAY_ALLOWED_ORDER_TYPES.has(orderType)) return null;
+  return {
+    transaction_id: String(transaction.transactionId),
+    transaction_time: Number(transaction.transactionTime || 0),
+    amount_usdt: amountUsdt,
+    order_type: orderType,
+  };
+}
+
+async function hmacSha256Hex(secret, message) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const digest = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function normalizePositiveUsdt(value) {
+  const raw = String(value ?? "").trim();
+  if (!/^\d+(?:\.\d{1,8})?$/.test(raw) || Number(raw) <= 0) return "";
+  const [whole, fraction = ""] = raw.split(".");
+  const trimmedFraction = fraction.replace(/0+$/, "");
+  return trimmedFraction ? `${BigInt(whole)}.${trimmedFraction}` : String(BigInt(whole));
+}
+
+function binanceUsdtToBalance(env, amountUsdt) {
+  const rate = Number(env.BINANCE_USDT_TO_BDT_RATE || 132);
+  const credited = Math.round(Number(amountUsdt) * rate);
+  if (!Number.isFinite(rate) || rate <= 0 || !Number.isSafeInteger(credited) || credited < 1) {
+    throw new Error("binance_invalid_conversion_rate");
+  }
+  return credited;
+}
+
+function binancePayId(env) {
+  const payId = String(env.BINANCE_PAY_ID || "").trim();
+  if (!/^\d{6,20}$/.test(payId)) {
+    throw new Error("binance_pay_id_not_configured");
+  }
+  return payId;
+}
+
+function safeBinanceError(error) {
+  const message = String(error?.message || error);
+  return /^binance_[a-z0-9_-]+$/i.test(message) ? message : "binance_unexpected_error";
+}
+
+function isDuplicateClaimError(error) {
+  const message = String(error?.message || "").toLowerCase();
+  return message.includes("unique") && message.includes("claimed_payments");
 }
 
 async function recordPaymentVerificationRejection(env, chatId, userId, reason) {
@@ -2359,8 +2406,8 @@ async function recordPaymentVerificationRejection(env, chatId, userId, reason) {
 
 function paymentVerificationRejectionText(lang) {
   return lang === "bn"
-    ? "❌ <b>পেমেন্ট যাচাই করা যায়নি</b>\n\nTransaction ID, নির্বাচিত wallet অথবা amount-এর তথ্য মিলছে না। সব তথ্য ভালোভাবে যাচাই করে আবার চেষ্টা করুন।"
-    : "❌ <b>Payment could not be verified</b>\n\nThe transaction ID, selected wallet, or entered amount does not match. Check all details carefully and try again.";
+    ? "❌ <b>পেমেন্ট যাচাই করা যায়নি</b>\n\nOrder ID অথবা Binance Pay payment-এর তথ্য মিলছে না। তথ্য যাচাই করে আবার চেষ্টা করুন।"
+    : "❌ <b>Payment could not be verified</b>\n\nThe Order ID or Binance Pay payment details did not match. Check the information and try again.";
 }
 
 async function sendPaymentVerificationUnavailable(env, chatId, userId) {
@@ -2458,13 +2505,14 @@ async function showOwnedProduct(env, chatId, userId, rawOrderId) {
 
 async function showRechargeHistory(env, chatId, userId) {
   const lang = await getLanguage(env, userId);
-  const result = await env.DB.prepare(`SELECT transaction_id, amount_bdt, provider, claimed_at FROM claimed_payments
+  const result = await env.DB.prepare(`SELECT transaction_id, amount_bdt, amount_usdt, provider, claimed_at FROM claimed_payments
     WHERE telegram_id = ? ORDER BY claimed_at DESC LIMIT 20`).bind(userId).all();
   const payments = result.results || [];
   const lines = [lang === "bn" ? "💳 <b>রিচার্জ হিস্ট্রি</b>" : "💳 <b>Recharge History</b>", ""];
   if (!payments.length) lines.push(lang === "bn" ? "এখনও কোনো রিচার্জ নেই।" : "No recharges yet.");
   for (const payment of payments) {
-    lines.push(`• <b>${escapeHtml(String(payment.provider || "").toUpperCase())}</b> — <b>${money(payment.amount_bdt)}</b>`);
+    const sourceAmount = payment.amount_usdt ? `${escapeHtml(payment.amount_usdt)} USDT → ` : "";
+    lines.push(`• <b>${escapeHtml(String(payment.provider || "").toUpperCase())}</b> — <b>${sourceAmount}${money(payment.amount_bdt)}</b>`);
     lines.push(`  ${maskTransactionId(payment.transaction_id)} · ${escapeHtml(String(payment.claimed_at || "").slice(0, 16))}`);
   }
   await sendMessageLines(env, chatId, lines);
@@ -4565,6 +4613,15 @@ async function sendMessage(env, chatId, text, extra = {}) {
   });
 }
 
+async function deleteMessageSafely(env, chatId, messageId) {
+  if (!messageId) return;
+  try {
+    await telegram(env, "deleteMessage", { chat_id: chatId, message_id: messageId });
+  } catch (error) {
+    console.warn(JSON.stringify({ event: "temporary_message_delete_failed", error: String(error?.message || error).slice(0, 120) }));
+  }
+}
+
 async function sendMessageLines(env, chatId, lines, maxLength = 3800) {
   let chunk = "";
   for (const line of lines) {
@@ -4829,7 +4886,7 @@ function parseStartReferrer(text, userId) {
 
 function normalizeTransactionId(value) {
   const normalized = String(value || "").trim().replace(/\s+/g, "").toUpperCase();
-  if (!/^[A-Z0-9]{6,32}$/.test(normalized)) return "";
+  if (!/^[A-Z0-9_-]{6,128}$/.test(normalized)) return "";
   return normalized;
 }
 

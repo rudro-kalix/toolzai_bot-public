@@ -29,7 +29,11 @@ npx wrangler secret put QUANTUM_VAULT_API_KEY
 npx wrangler secret put MANAGER_API_SECRET
 npx wrangler secret put FIREBASE_CLIENT_EMAIL
 npx wrangler secret put FIREBASE_PRIVATE_KEY
+npx wrangler secret put BINANCE_API_KEY
+npx wrangler secret put BINANCE_SECRET_KEY
 ```
+
+The Binance key needs read-only user-data access for `GET /sapi/v1/pay/transactions`; do not enable trading or withdrawals. Set the public `BINANCE_PAY_ID` and the `BINANCE_USDT_TO_BDT_RATE` conversion value in `wrangler.toml`. Submitted Binance Pay Order IDs are matched against successful incoming USDT Pay history, claimed once, and converted into the bot's whole-BDT balance at that configured rate.
 
 `SELLER_CONFIG_ENCRYPTION_KEY` is optional. When omitted, the Worker derives seller-key encryption from `MANAGER_API_SECRET`.
 
@@ -42,6 +46,7 @@ npx wrangler d1 execute your_bot_database --remote --file=./migrations/011_selle
 npx wrangler d1 execute your_bot_database --remote --file=./migrations/012_local_products_inventory.sql
 npx wrangler d1 execute your_bot_database --remote --file=./migrations/013_firebase_project_connections.sql
 npx wrangler d1 execute your_bot_database --remote --file=./migrations/014_warranty_claims.sql
+npx wrangler d1 execute your_bot_database --remote --file=./migrations/015_binance_pay.sql
 ```
 
 To enable whole-project Firebase switching from the private manager, set one stable encryption secret. New service-account JSON credentials are tested before activation and encrypted in D1; previous connections remain available for rollback.

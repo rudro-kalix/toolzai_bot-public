@@ -12,15 +12,24 @@ if (!token) {
 }
 
 const webhookUrl = `${baseUrl.replace(/\/+$/, "")}/webhook/${encodeURIComponent(secret)}`;
-const response = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
-  method: "POST",
-  headers: { "content-type": "application/json" },
-  body: JSON.stringify({
-    url: webhookUrl,
-    secret_token: secret,
-    allowed_updates: ["message", "callback_query"],
-  }),
+const telegram = async (method, body) => {
+  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await response.json();
+  if (!response.ok || data.ok === false) throw new Error(data.description || `${method} failed`);
+  return data;
+};
+
+const webhook = await telegram("setWebhook", {
+  url: webhookUrl,
+  secret_token: secret,
+  allowed_updates: ["message", "callback_query"],
+});
+const commands = await telegram("setMyCommands", {
+  commands: [{ command: "start", description: "Start the bot" }],
 });
 
-const data = await response.json();
-console.log(JSON.stringify(data, null, 2));
+console.log(JSON.stringify({ webhook, commands }, null, 2));

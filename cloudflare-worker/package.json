@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node tests/payment-privacy.test.mjs && node tests/seller-api-adapter.test.mjs && node tests/local-inventory.test.mjs && node tests/withdrawal-evidence.test.mjs && node tests/firestore-manager.test.mjs && node tests/history-warranty.test.mjs",
+    "test": "node tests/payment-privacy.test.mjs && node tests/binance-pay.test.mjs && node tests/seller-api-adapter.test.mjs && node tests/local-inventory.test.mjs && node tests/withdrawal-evidence.test.mjs && node tests/firestore-manager.test.mjs && node tests/history-warranty.test.mjs",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "db:migrate:local": "wrangler d1 execute toolzai_bot --local --file=./schema.sql",

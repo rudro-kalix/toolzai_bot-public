@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS claimed_payments (
   transaction_id TEXT PRIMARY KEY,
   telegram_id INTEGER NOT NULL,
   amount_bdt INTEGER NOT NULL,
+  amount_usdt TEXT,
   provider TEXT NOT NULL,
   source_document TEXT,
   claimed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP

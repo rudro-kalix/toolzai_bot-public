@@ -2,19 +2,21 @@
 
 ## Never commit credentials
 
-Use Cloudflare Worker secrets and Vercel server-side environment variables for all tokens and keys. Never commit Telegram tokens, seller API keys, Firebase service-account keys, manager passwords, session secrets, webhook secrets, payment account numbers, or real database IDs.
+Store Telegram tokens, Binance keys, seller API keys, webhook secrets, Firebase credentials, and other secrets with `wrangler secret put`. Keep production `wrangler.toml`, `.dev.vars`, `.env` files, local databases, and Wrangler state out of Git.
 
-If a credential is exposed, remove it from the current code and rotate it immediately. Deleting a Git line does not invalidate a leaked credential or remove it from history.
+The Binance API key should be read-only and must not permit trading or withdrawals. Use the smallest permission scope that can read Binance Pay transaction history.
+
+If a credential is exposed in a commit, screenshot, log, issue, or chat, rotate it immediately. Removing a line from the current branch neither invalidates the credential nor erases it from Git history.
 
 ## Production checklist
 
-- Set a long, unique `MANAGER_API_SECRET`, `SESSION_SECRET`, and dashboard password.
-- Keep Firestore closed to anonymous reads and writes; let the Worker use authenticated service-account access.
-- Give the Vercel Cloudflare token access only to the required D1 database.
-- Restrict admin commands to your Telegram numeric IDs.
-- Validate webhook secret headers and use HTTPS endpoints only.
-- Keep seller keys encrypted at rest and rotate them periodically.
-- Review D1 audit records and failed health checks.
+- Restrict admin commands to trusted Telegram numeric IDs.
+- Validate Telegram webhook secret headers and use HTTPS endpoints only.
+- Keep Binance, Telegram, seller, and Firebase credentials in Cloudflare secrets.
+- Prevent an Order ID from being claimed more than once and keep migration `015_binance_pay.sql` applied.
+- Give D1, Firebase, and seller credentials the least privileges needed.
+- Review Worker logs without recording credentials or payment data.
+- Rotate secrets periodically and immediately after suspected exposure.
 
 ## Reporting a vulnerability
 

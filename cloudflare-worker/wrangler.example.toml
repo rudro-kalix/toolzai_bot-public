@@ -1,9 +1,13 @@
-name = "digital-product-telegram-bot"
+name = "toolzai-telegram-bot"
 main = "src/worker.js"
-compatibility_date = "2026-07-10"
+compatibility_date = "2026-07-15"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
 
 [triggers]
-crons = ["* * * * *"]
+crons = ["*/5 * * * *"]
 
 [[d1_databases]]
 binding = "DB"
@@ -11,12 +15,12 @@ database_name = "digital_product_bot"
 database_id = "00000000-0000-0000-0000-000000000000"
 
 [vars]
-QUANTUM_VAULT_BASE_URL = "https://www.quantumvault.me/api/v1"
+QUANTUM_VAULT_BASE_URL = "https://your-seller-api.example"
+BINANCE_PAY_ID = "your-binance-pay-id"
+BINANCE_USDT_TO_BDT_RATE = "132"
 FIREBASE_PROJECT_ID = "your-firebase-project-id"
-FIREBASE_PAYMENTS_COLLECTION = "transactions,notifications"
-FIREBASE_CLAIMS_COLLECTION = "transaction_claims"
-FIREBASE_REFERRALS_COLLECTION = "referrals"
-ADMIN_IDS = "your-telegram-numeric-id"
+FIREBASE_PAYMENT_COLLECTION = "payments"
+ADMIN_IDS = "123456789"
 SUPPORT_URL = "https://t.me/your_support_username"
-REQUIRED_CHANNEL_USERNAME = "@your_channel"
+REQUIRED_CHANNEL = "@your_channel"
 REQUIRED_CHANNEL_URL = "https://t.me/your_channel"
