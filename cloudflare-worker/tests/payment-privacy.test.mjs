@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 
 const source = fs.readFileSync(new URL("../src/worker.js", import.meta.url), "utf8");
+const schema = fs.readFileSync(new URL("../schema.sql", import.meta.url), "utf8");
+const attemptMigration = fs.readFileSync(new URL("../migrations/018_payment_attempt_history.sql", import.meta.url), "utf8");
 const exposed = `${source}\nexport { paymentVerificationRejectionText, paymentVerificationUnavailableText };`;
 const worker = await import(`data:text/javascript;base64,${Buffer.from(exposed).toString("base64")}`);
 
@@ -36,9 +38,11 @@ assert.match(mobileHandler, /findFirestorePayment\(env, normalized\)/);
 assert.match(mobileHandler, /firestoreClaimExists\(env, normalized\)/);
 assert.match(mobileHandler, /createFirestoreClaim\(env, payment, userId, actualAmount\)/);
 assert.match(mobileHandler, /finally\s*{\s*await deleteMessageSafely/s);
+assert.match(mobileHandler, /recordPaymentVerificationAttempt\(env/);
 assert.match(binanceHandler, /findBinancePayTransaction\(env, normalized\)/);
 assert.match(binanceHandler, /"payment_not_found"/);
 assert.match(binanceHandler, /finally\s*{\s*await deleteMessageSafely/s);
+assert.match(binanceHandler, /recordPaymentVerificationAttempt\(env/);
 assert.doesNotMatch(binanceHandler, /findFirestorePayment|firestoreClaimExists|createFirestoreClaim/);
 for (const provider of ["bkash", "nagad", "rocket", "upay", "binance"]) {
   assert.match(source, new RegExp(`pay_provider:${provider}`), `${provider} must remain in Add Balance`);
@@ -58,6 +62,13 @@ assert.match(source, /\.replaceAll\(placeholder, `<code>\$\{escapedValue\}<\/cod
 assert.match(source, /\["bkash", "nagad", "upay"\]/);
 assert.match(source, /\["pay_id", "rate"\]/);
 assert.match(source, /\["account"\]/);
+assert.doesNotMatch(source, /View Balance|ব্যালেন্স দেখুন/);
+assert.match(source, /Add Balance/);
+assert.match(source, /ব্যালেন্স যোগ করুন/);
+assert.match(source, /paymentAttempts:/);
+assert.match(source, /operation === "userDetail"/);
+assert.match(schema, /CREATE TABLE IF NOT EXISTS payment_verification_attempts/);
+assert.match(attemptMigration, /status TEXT NOT NULL CHECK \(status IN \('verified', 'rejected', 'unavailable', 'rate_limited', 'invalid_input'\)\)/);
 assert.doesNotMatch(source, /BINANCE_(?:API|SECRET)_KEY\s*=\s*["'][^"']+/);
 
 console.log("Payment verification privacy checks passed.");

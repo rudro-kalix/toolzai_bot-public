@@ -322,7 +322,7 @@ async function handleManagerRequest(request, env, ctx) {
       ? 409
       : safeError === "seller_test_unauthorized"
         ? 401
-        : safeError === "firestore_document_not_found"
+        : safeError === "firestore_document_not_found" || safeError === "user_not_found"
           ? 404
           : safeError.startsWith("menu_") || safeError.startsWith("invalid_") || safeError.startsWith("seller_") || safeError.startsWith("local_") || safeError.startsWith("firebase_") || safeError.startsWith("firestore_invalid_") || safeError.startsWith("redeem_") || safeError === "withdrawal_not_found"
             ? 400
@@ -591,6 +591,60 @@ async function runManagerOperation(env, payload, ctx = null) {
     return { rows: [], changes: Number(result.meta?.changes || 0) };
   }
 
+  if (operation === "userDetail") {
+    const telegramId = Number(payload?.telegramId);
+    if (!Number.isSafeInteger(telegramId) || telegramId < 1) throw new Error("invalid_user_id");
+    const results = await env.DB.batch([
+      env.DB.prepare(`SELECT users.telegram_id, users.username, users.first_name, users.last_name,
+        users.balance_bdt, users.language, users.human_verified, users.created_at, users.updated_at,
+        (SELECT COUNT(*) FROM local_orders WHERE telegram_id = users.telegram_id) AS purchase_count,
+        (SELECT COALESCE(SUM(charged_bdt), 0) FROM local_orders WHERE telegram_id = users.telegram_id) AS purchase_total,
+        (SELECT COUNT(*) FROM claimed_payments WHERE telegram_id = users.telegram_id) AS recharge_count,
+        (SELECT COALESCE(SUM(amount_bdt), 0) FROM claimed_payments WHERE telegram_id = users.telegram_id) AS recharge_total,
+        (SELECT COUNT(*) FROM payment_verification_attempts WHERE telegram_id = users.telegram_id AND status != 'verified') AS failed_attempts,
+        (SELECT COALESCE(SUM(amount_bdt), 0) FROM redeem_code_redemptions WHERE telegram_id = users.telegram_id) AS redeem_total,
+        (SELECT COALESCE(SUM(reward_bdt), 0) FROM referral_rewards WHERE referrer_id = users.telegram_id) AS referral_earned,
+        (SELECT COUNT(*) FROM referrals WHERE referrer_id = users.telegram_id) AS referred_users
+        FROM users WHERE users.telegram_id = ?`).bind(telegramId),
+      env.DB.prepare(`SELECT orders.id, orders.telegram_id, orders.product_key, orders.variant_key,
+        orders.quantity, orders.charged_bdt, orders.provider_order_id, orders.fulfillment_source,
+        COALESCE(fulfillments.status, 'legacy') AS delivery_status,
+        fulfillments.attempts AS delivery_attempts, orders.created_at
+        FROM local_orders AS orders
+        LEFT JOIN order_fulfillments AS fulfillments ON fulfillments.local_order_id = orders.id
+        WHERE orders.telegram_id = ? ORDER BY orders.id DESC LIMIT 100`).bind(telegramId),
+      env.DB.prepare(`SELECT transaction_id, telegram_id, amount_bdt, amount_usdt, provider,
+        source_document, claimed_at FROM claimed_payments
+        WHERE telegram_id = ? ORDER BY claimed_at DESC LIMIT 100`).bind(telegramId),
+      env.DB.prepare(`SELECT id, telegram_id, transaction_id, provider, expected_amount_bdt,
+        actual_amount_bdt, actual_provider, status, reason, created_at
+        FROM payment_verification_attempts WHERE telegram_id = ? ORDER BY created_at DESC, id DESC LIMIT 100`).bind(telegramId),
+      env.DB.prepare(`SELECT redemptions.id, redemptions.amount_bdt, redemptions.redeemed_at, codes.code_hint
+        FROM redeem_code_redemptions AS redemptions
+        LEFT JOIN redeem_codes AS codes ON codes.id = redemptions.code_id
+        WHERE redemptions.telegram_id = ? ORDER BY redemptions.redeemed_at DESC LIMIT 100`).bind(telegramId),
+      env.DB.prepare(`SELECT id, amount_bdt, bkash_number, status, admin_note, created_at, reviewed_at
+        FROM referral_withdrawals WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 100`).bind(telegramId),
+      env.DB.prepare(`SELECT id, local_order_id, product_key, provider_order_id, unit_id, issue_text,
+        status, admin_note, created_at, reviewed_at FROM warranty_claims
+        WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 100`).bind(telegramId),
+    ]);
+    const user = results[0]?.results?.[0];
+    if (!user) throw new Error("user_not_found");
+    return {
+      rows: [{
+        user,
+        orders: results[1]?.results || [],
+        payments: results[2]?.results || [],
+        attempts: results[3]?.results || [],
+        redemptions: results[4]?.results || [],
+        withdrawals: results[5]?.results || [],
+        warranty_claims: results[6]?.results || [],
+      }],
+      changes: 0,
+    };
+  }
+
   const reads = {
     overview: `SELECT
       (SELECT COUNT(*) FROM users) AS users,
@@ -601,12 +655,27 @@ async function runManagerOperation(env, payload, ctx = null) {
       (SELECT COALESCE(SUM(charged_bdt), 0) FROM local_orders) AS charged,
       (SELECT COUNT(*) FROM referrals WHERE status = 'completed') AS referrals,
       (SELECT COALESCE(SUM(reward_bdt), 0) FROM referral_rewards) AS referral_rewards,
-      (SELECT COUNT(*) FROM referral_withdrawals WHERE status = 'pending') AS pending_withdrawals`,
-    users: "SELECT telegram_id, username, first_name, last_name, balance_bdt, language, human_verified, created_at FROM users ORDER BY created_at DESC LIMIT 100",
+      (SELECT COUNT(*) FROM referral_withdrawals WHERE status = 'pending') AS pending_withdrawals,
+      (SELECT COUNT(*) FROM payment_verification_attempts WHERE status != 'verified') AS failed_payment_attempts`,
+    users: `SELECT users.telegram_id, users.username, users.first_name, users.last_name, users.balance_bdt,
+      users.language, users.human_verified, users.created_at,
+      (SELECT COUNT(*) FROM local_orders WHERE telegram_id = users.telegram_id) AS purchase_count,
+      (SELECT COALESCE(SUM(charged_bdt), 0) FROM local_orders WHERE telegram_id = users.telegram_id) AS purchase_total,
+      (SELECT COUNT(*) FROM claimed_payments WHERE telegram_id = users.telegram_id) AS recharge_count,
+      (SELECT COALESCE(SUM(amount_bdt), 0) FROM claimed_payments WHERE telegram_id = users.telegram_id) AS recharge_total,
+      (SELECT COUNT(*) FROM payment_verification_attempts WHERE telegram_id = users.telegram_id AND status != 'verified') AS failed_attempts
+      FROM users ORDER BY users.created_at DESC LIMIT 100`,
     payments: `SELECT payments.transaction_id, payments.telegram_id, payments.amount_bdt, payments.provider,
       payments.claimed_at, users.username, users.first_name, users.last_name
       FROM claimed_payments AS payments LEFT JOIN users ON users.telegram_id = payments.telegram_id
       ORDER BY payments.claimed_at DESC LIMIT 100`,
+    paymentAttempts: `SELECT attempts.id, attempts.telegram_id, attempts.transaction_id, attempts.provider,
+      attempts.expected_amount_bdt, attempts.actual_amount_bdt, attempts.actual_provider,
+      attempts.status, attempts.reason, attempts.created_at,
+      users.username, users.first_name, users.last_name
+      FROM payment_verification_attempts AS attempts
+      LEFT JOIN users ON users.telegram_id = attempts.telegram_id
+      ORDER BY attempts.created_at DESC, attempts.id DESC LIMIT 200`,
     orders: `SELECT orders.id, orders.telegram_id, orders.product_key, orders.variant_key, orders.quantity,
       orders.charged_bdt, orders.provider_order_id, orders.fulfillment_source,
       COALESCE(fulfillments.status, 'legacy') AS delivery_status, fulfillments.attempts AS delivery_attempts,
@@ -974,6 +1043,7 @@ async function secureEqual(left, right) {
 
 function safeManagerError(error) {
   const message = String(error?.message || "operation_failed");
+  if (message === "user_not_found") return message;
   if (message === "stale_menu_draft" || /^menu_[a-z0-9_]+$/.test(message)) return message;
   if (/^(invalid_announcement|invalid_withdrawal|withdrawal_)[a-z0-9_]*$/.test(message)) return message;
   if (/^redeem_[a-z0-9_]+$/.test(message)) return message;
@@ -1475,7 +1545,6 @@ async function buildMenuActionPreview(env, menu, request) {
   if (request.action === "balance") {
     const balance = await getBalance(env, adminId);
     return previewResult(menu, "balance", language, { balance: money(balance) }, [
-      [{ label: language === "bn" ? "💰 ব্যালেন্স দেখুন" : "💰 View Balance", kind: "callback", value: "balance" }],
       [{ label: language === "bn" ? "➕ ব্যালেন্স যোগ করুন" : "➕ Add Balance", kind: "callback", value: "add_balance" }],
     ]);
   }
@@ -2431,7 +2500,6 @@ async function showBalance(env, chatId, userId) {
   await sendMessage(env, chatId, await botText(env, `balance_menu_${lang}`, fallback, { balance: money(balance) }), {
     reply_markup: {
       inline_keyboard: [
-        [{ text: lang === "bn" ? "💰 ব্যালেন্স দেখুন" : "💰 View Balance", callback_data: "balance" }],
         [{ text: lang === "bn" ? "➕ ব্যালেন্স যোগ করুন" : "➕ Add Balance", callback_data: "add_balance" }],
       ],
     },
@@ -2536,11 +2604,21 @@ async function handlePaymentAmount(env, chatId, userId, text, state) {
 
 async function handleMobileTransactionId(env, chatId, userId, transactionId, state) {
   const normalized = normalizeTransactionId(transactionId);
+  const expectedProvider = String(state.payment_provider || "").toLowerCase();
+  const expectedAmount = Number(state.payment_amount_bdt || 0);
   if (!normalized) {
+    await recordPaymentVerificationAttempt(env, {
+      telegramId: userId, transactionId, provider: expectedProvider || "mobile",
+      expectedAmountBdt: expectedAmount, status: "invalid_input", reason: "invalid_transaction_id",
+    });
     await sendMessage(env, chatId, "❌ Send a valid transaction ID.");
     return;
   }
   if (!(await consumePaymentAttempt(env, userId))) {
+    await recordPaymentVerificationAttempt(env, {
+      telegramId: userId, transactionId: normalized, provider: expectedProvider || "mobile",
+      expectedAmountBdt: expectedAmount, status: "rate_limited", reason: "too_many_attempts",
+    });
     await sendMessage(env, chatId, "❌ Too many transaction ID checks. Please wait 5 minutes and try again.");
     return;
   }
@@ -2552,17 +2630,15 @@ async function handleMobileTransactionId(env, chatId, userId, transactionId, sta
       outcome = { kind: "rejected", reason: "local_claim_exists" };
     } else {
       const payment = await findFirestorePayment(env, normalized);
-      const expectedProvider = state.payment_provider;
-      const expectedAmount = Number(state.payment_amount_bdt || 0);
       const actualAmount = payment ? Math.round(payment.amount_bdt) : 0;
       if (!payment) {
         outcome = { kind: "rejected", reason: "payment_not_found" };
       } else if (payment.provider !== expectedProvider) {
-        outcome = { kind: "rejected", reason: "provider_mismatch" };
+        outcome = { kind: "rejected", reason: "provider_mismatch", actualProvider: payment.provider, actualAmount };
       } else if (actualAmount !== expectedAmount) {
-        outcome = { kind: "rejected", reason: "amount_mismatch" };
+        outcome = { kind: "rejected", reason: "amount_mismatch", actualProvider: payment.provider, actualAmount };
       } else if (await firestoreClaimExists(env, normalized)) {
-        outcome = { kind: "rejected", reason: "firestore_claim_exists" };
+        outcome = { kind: "rejected", reason: "firestore_claim_exists", actualProvider: payment.provider, actualAmount };
       } else {
         await createFirestoreClaim(env, payment, userId, actualAmount);
         await env.DB.prepare("INSERT INTO claimed_payments (transaction_id, telegram_id, amount_bdt, provider, source_document) VALUES (?, ?, ?, ?, ?)")
@@ -2588,6 +2664,17 @@ async function handleMobileTransactionId(env, chatId, userId, transactionId, sta
     await deleteMessageSafely(env, chatId, verifying?.result?.message_id);
   }
 
+  await recordPaymentVerificationAttempt(env, {
+    telegramId: userId,
+    transactionId: normalized,
+    provider: expectedProvider || "mobile",
+    expectedAmountBdt: expectedAmount,
+    actualAmountBdt: outcome?.kind === "verified" ? outcome.actualAmount : outcome?.actualAmount,
+    actualProvider: outcome?.kind === "verified" ? outcome.payment.provider : outcome?.actualProvider,
+    status: outcome?.kind === "verified" ? "verified" : outcome?.kind === "rejected" ? "rejected" : "unavailable",
+    reason: outcome?.kind === "verified" ? "matched" : outcome?.kind === "rejected" ? outcome.reason : "backend_unavailable",
+  });
+
   if (outcome?.kind === "verified") {
     await sendMessage(env, chatId, `✅ <b>Payment verified</b>\n\n🏦 Provider: <b>${outcome.payment.provider.toUpperCase()}</b>\n💳 Amount: <b>${money(outcome.actualAmount)}</b>\n💵 Credited: <b>${money(outcome.actualAmount)}</b>\n💰 New balance: <b>${money(outcome.newBalance)}</b>`);
   } else if (outcome?.kind === "rejected") {
@@ -2600,10 +2687,18 @@ async function handleMobileTransactionId(env, chatId, userId, transactionId, sta
 async function handleBinanceOrderId(env, chatId, userId, transactionId) {
   const normalized = normalizeTransactionId(transactionId);
   if (!normalized) {
+    await recordPaymentVerificationAttempt(env, {
+      telegramId: userId, transactionId, provider: "binance_pay",
+      status: "invalid_input", reason: "invalid_order_id",
+    });
     await sendMessage(env, chatId, "❌ Send a valid Binance Order ID.");
     return;
   }
   if (!(await consumePaymentAttempt(env, userId))) {
+    await recordPaymentVerificationAttempt(env, {
+      telegramId: userId, transactionId: normalized, provider: "binance_pay",
+      status: "rate_limited", reason: "too_many_attempts",
+    });
     await sendMessage(env, chatId, "❌ Too many order checks. Please wait 5 minutes and try again.");
     return;
   }
@@ -2644,6 +2739,16 @@ async function handleBinanceOrderId(env, chatId, userId, transactionId) {
   } finally {
     await deleteMessageSafely(env, chatId, verifying?.result?.message_id);
   }
+
+  await recordPaymentVerificationAttempt(env, {
+    telegramId: userId,
+    transactionId: normalized,
+    provider: "binance_pay",
+    actualAmountBdt: outcome?.kind === "verified" ? outcome.creditedBdt : null,
+    actualProvider: outcome?.kind === "verified" ? "binance_pay" : null,
+    status: outcome?.kind === "verified" ? "verified" : outcome?.kind === "rejected" ? "rejected" : "unavailable",
+    reason: outcome?.kind === "verified" ? "matched" : outcome?.kind === "rejected" ? outcome.reason : "backend_unavailable",
+  });
 
   if (outcome?.kind === "verified") {
     await sendMessage(env, chatId, `💰 <b>Payment Verified Successfully!</b>\n\n✅ Amount: <b>${escapeHtml(outcome.payment.amount_usdt)} USDT</b>\n📋 Order ID: <code>${escapeHtml(outcome.payment.transaction_id)}</code>\n💵 Credited: <b>${money(outcome.creditedBdt)}</b>\n💰 New Balance: <b>${money(outcome.newBalance)}</b>\n\nThank you for your payment! 🎉`);
@@ -2746,6 +2851,44 @@ function safeBinanceError(error) {
 function isDuplicateClaimError(error) {
   const message = String(error?.message || "").toLowerCase();
   return message.includes("unique") && message.includes("claimed_payments");
+}
+
+async function recordPaymentVerificationAttempt(env, attempt) {
+  try {
+    const telegramId = Number(attempt?.telegramId);
+    if (!Number.isSafeInteger(telegramId) || telegramId < 1) return;
+    const status = String(attempt?.status || "unavailable");
+    if (!["verified", "rejected", "unavailable", "rate_limited", "invalid_input"].includes(status)) return;
+    const identifier = String(attempt?.transactionId || "").trim().slice(0, 128);
+    const provider = String(attempt?.provider || "unknown").trim().toLowerCase().slice(0, 40) || "unknown";
+    const reason = String(attempt?.reason || "unknown").trim().toLowerCase().slice(0, 80) || "unknown";
+    const actualProvider = String(attempt?.actualProvider || "").trim().toLowerCase().slice(0, 40) || null;
+    const expectedAmount = attempt?.expectedAmountBdt === null || attempt?.expectedAmountBdt === undefined || attempt?.expectedAmountBdt === ""
+      ? null : Number(attempt.expectedAmountBdt);
+    const actualAmount = attempt?.actualAmountBdt === null || attempt?.actualAmountBdt === undefined || attempt?.actualAmountBdt === ""
+      ? null : Number(attempt.actualAmountBdt);
+    await env.DB.prepare(`INSERT INTO payment_verification_attempts
+      (telegram_id, transaction_id, provider, expected_amount_bdt, actual_amount_bdt,
+       actual_provider, status, reason)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(
+        telegramId,
+        identifier,
+        provider,
+        expectedAmount !== null && Number.isFinite(expectedAmount) && expectedAmount >= 0 ? expectedAmount : null,
+        actualAmount !== null && Number.isFinite(actualAmount) && actualAmount >= 0 ? actualAmount : null,
+        actualProvider,
+        status,
+        reason,
+      )
+      .run();
+  } catch (error) {
+    console.error(JSON.stringify({
+      event: "payment_attempt_log_failed",
+      user_id: Number(attempt?.telegramId || 0) || null,
+      error: error?.message || String(error),
+    }));
+  }
 }
 
 async function recordPaymentVerificationRejection(env, chatId, userId, reason) {
@@ -3420,12 +3563,38 @@ function normalizeSellerProduct(source, mapping) {
     productKey,
     name: String(readJsonPath(source, mapping.productName) || productKey),
     description: String(readJsonPath(source, mapping.productDescription) || ""),
-    warranty: String(readJsonPath(source, mapping.productWarranty) || ""),
+    warranty: formatSellerWarranty(readJsonPath(source, mapping.productWarranty)),
     price: nullableNumber(readJsonPath(source, mapping.productPrice)),
     stock: nullableNumber(readJsonPath(source, mapping.productStock)),
     inStock: Boolean(readJsonPath(source, mapping.productInStock)),
     variants,
   };
+}
+
+function formatSellerWarranty(value) {
+  if (value === null || value === undefined || value === "") return "";
+  if (typeof value !== "object") return String(value).trim();
+  if (Array.isArray(value)) return value.map(formatSellerWarranty).filter(Boolean).join(" · ");
+
+  const details = [value.details, value.description, value.terms, value.text, value.label]
+    .map((item) => typeof item === "string" ? item.trim() : "")
+    .find(Boolean) || "";
+  const durationDays = nullableNumber(value.durationDays ?? value.days);
+  if (durationDays !== null && durationDays >= 0) {
+    const duration = `${durationDays} ${durationDays === 1 ? "day" : "days"}`;
+    return details ? `${duration} — ${details}` : duration;
+  }
+  if (details) return details;
+
+  return Object.entries(value)
+    .map(([key, item]) => {
+      const text = formatSellerWarranty(item);
+      if (!text) return "";
+      const label = key.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ");
+      return `${label}: ${text}`;
+    })
+    .filter(Boolean)
+    .join(" · ");
 }
 
 function normalizeSellerOrder(source, mapping) {

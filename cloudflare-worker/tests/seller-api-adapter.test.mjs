@@ -35,6 +35,23 @@ const products = worker.normalizeSellerResponse({ products: [{
 assert.equal(products.products[0].productKey, "outlook_mail");
 assert.equal(products.products[0].stock, 143);
 
+const warrantyProduct = worker.normalizeSellerResponse({ product: {
+  productKey: "chat_gpt_plus_25d_warranty",
+  name: "Chat GPT Plus 25D warranty",
+  warranty: { durationDays: 25, details: "" },
+  variants: [],
+} }, "product", config.mapping);
+assert.equal(warrantyProduct.product.warranty, "25 days");
+
+const detailedWarrantyProduct = worker.normalizeSellerResponse({ product: {
+  productKey: "covered_product",
+  name: "Covered product",
+  warranty: { durationDays: 1, details: "Replacement for invalid credentials" },
+  variants: [],
+} }, "product", config.mapping);
+assert.equal(detailedWarrantyProduct.product.warranty, "1 day — Replacement for invalid credentials");
+assert.notEqual(detailedWarrantyProduct.product.warranty, "[object Object]");
+
 const purchase = worker.normalizeSellerResponse({ success: true, order: {
   requested: 1,
   fulfilled: 1,
