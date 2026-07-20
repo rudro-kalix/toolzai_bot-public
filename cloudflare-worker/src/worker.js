@@ -710,6 +710,12 @@ async function runManagerOperation(env, payload, ctx = null) {
       ORDER BY CASE withdrawals.status WHEN 'pending' THEN 0 ELSE 1 END, withdrawals.created_at DESC LIMIT 100`,
     announcements: `SELECT id, message_text, button_label, button_url, status, recipient_count, delivered_count,
       failed_count, created_at, started_at, completed_at FROM announcement_campaigns ORDER BY created_at DESC LIMIT 50`,
+    directMessages: `SELECT messages.id, messages.telegram_id, messages.message_text, messages.button_label,
+      messages.button_url, messages.status, messages.telegram_message_id, messages.error_text,
+      messages.created_at, messages.sent_at, users.username, users.first_name, users.last_name
+      FROM direct_messages AS messages
+      LEFT JOIN users ON users.telegram_id = messages.telegram_id
+      ORDER BY messages.created_at DESC LIMIT 100`,
     redeemCodes: `SELECT codes.id, codes.code_hint, codes.amount_bdt, codes.max_redemptions, codes.used_count,
       codes.active, codes.expires_at, codes.created_at, MAX(redemptions.redeemed_at) AS last_redeemed_at
       FROM redeem_codes AS codes
@@ -764,6 +770,43 @@ async function runManagerOperation(env, payload, ctx = null) {
     if (ctx) ctx.waitUntil(processing);
     else await processing;
     return { rows: [{ id: campaignId, status: "queued", recipient_count: recipientCount }], changes: recipientCount + 1 };
+  }
+
+  if (operation === "sendDirectMessage") {
+    const telegramId = Number(payload?.telegramId);
+    const messageText = String(payload?.messageText || "").trim();
+    const buttonLabel = String(payload?.buttonLabel || "").trim();
+    const buttonUrl = String(payload?.buttonUrl || "").trim();
+    if (!Number.isSafeInteger(telegramId) || telegramId < 1) throw new Error("invalid_direct_message_user");
+    if (!messageText || messageText.length > ANNOUNCEMENT_MAX_TEXT_CHARS) throw new Error("invalid_direct_message_text");
+    if ((buttonLabel && !buttonUrl) || (!buttonLabel && buttonUrl) || buttonLabel.length > 64) throw new Error("invalid_direct_message_button");
+    if (buttonUrl && !/^https:\/\/[A-Za-z0-9.-]+(?:\/[^\s]*)?$/.test(buttonUrl)) throw new Error("invalid_direct_message_url");
+    if (!env.TELEGRAM_BOT_TOKEN) throw new Error("direct_message_unavailable");
+    const user = await env.DB.prepare("SELECT telegram_id, username, first_name, last_name FROM users WHERE telegram_id = ?")
+      .bind(telegramId).first();
+    if (!user) throw new Error("user_not_found");
+
+    const messageId = crypto.randomUUID();
+    await env.DB.prepare(`INSERT INTO direct_messages
+      (id, telegram_id, message_text, button_label, button_url, status)
+      VALUES (?, ?, ?, ?, ?, 'pending')`)
+      .bind(messageId, telegramId, messageText, buttonLabel || null, buttonUrl || null).run();
+    const extra = buttonLabel && buttonUrl
+      ? { reply_markup: { inline_keyboard: [[{ text: buttonLabel, url: buttonUrl }]] } }
+      : {};
+    let telegramResult;
+    try {
+      telegramResult = await sendMessage(env, telegramId, renderEditableBotText(messageText), extra);
+    } catch (error) {
+      await env.DB.prepare(`UPDATE direct_messages SET status = 'failed', error_text = ? WHERE id = ?`)
+        .bind(String(error?.message || "Telegram delivery failed").slice(0, 240), messageId).run();
+      throw new Error("direct_message_delivery_failed");
+    }
+    const telegramMessageId = Number(telegramResult?.result?.message_id || 0) || null;
+    await env.DB.prepare(`UPDATE direct_messages SET status = 'delivered', telegram_message_id = ?,
+      error_text = NULL, sent_at = CURRENT_TIMESTAMP WHERE id = ?`)
+      .bind(telegramMessageId, messageId).run();
+    return { rows: [{ id: messageId, telegram_id: telegramId, status: "delivered", telegram_message_id: telegramMessageId }], changes: 1 };
   }
 
   if (operation === "updateWithdrawalStatus") {
@@ -1046,6 +1089,7 @@ function safeManagerError(error) {
   if (message === "user_not_found") return message;
   if (message === "stale_menu_draft" || /^menu_[a-z0-9_]+$/.test(message)) return message;
   if (/^(invalid_announcement|invalid_withdrawal|withdrawal_)[a-z0-9_]*$/.test(message)) return message;
+  if (/^(invalid_direct_message|direct_message_)[a-z0-9_]*$/.test(message)) return message;
   if (/^redeem_[a-z0-9_]+$/.test(message)) return message;
   if (/^seller_[a-z0-9_]+$/.test(message)) return message;
   if (/^local_[a-z0-9_]+$/.test(message) || /^invalid_inventory_[a-z0-9_]+$/.test(message)) return message;
